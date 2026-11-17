@@ -33,6 +33,7 @@ internal static class InstallerTests
             SetupProgram.SaveUpdatePreference(false);
             Check(Object.Equals(SetupProgram.ReadSettings(Path.Combine(profile, "settings.json"))["automatic_updates"], false), "Update preference not saved");
             Check(Convert.ToString(SetupProgram.ReadSettings(Path.Combine(profile, "settings.json"))["theme"]) == "dark", "Existing settings lost");
+            SetupProgram.SaveUpdatePreference(true);
             using (SetupForm form = new SetupForm(true)) using (Bitmap image = new Bitmap(form.Width, form.Height))
             { form.Opacity = 0; form.ShowInTaskbar = false; form.Show(); Application.DoEvents(); form.DrawToBitmap(image, new Rectangle(Point.Empty, form.Size)); image.Save(Path.Combine(root, "installer.png")); }
             Console.WriteLine("PASS: install, cancellation, deployment rollback, replacement, user files, preferences, installer render."); return 0;

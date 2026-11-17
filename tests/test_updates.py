@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +15,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, QObject, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from updates import UpdateManager, Release, verified_pending, file_matches, version_tuple, INSTALLER_NAME, launch_pending_update
 from version import REPOSITORY, VERSION
@@ -117,6 +118,17 @@ def test_reject_insecure_redirect(app, server, tmp_path):
     assert len(server["requests"]) == 1 and not update._ready
 
 
+def test_approve_github_https_redirect(app, tmp_path):
+    class Reply(QObject):
+        redirectAllowed = Signal()
+    reply = Reply(); approved = []
+    reply.redirectAllowed.connect(lambda: approved.append(True))
+    update = UpdateManager(profile=tmp_path); update.reply = reply
+    update._redirected(QUrl("https://release-assets.githubusercontent.com/asset"))
+    assert approved == [True]
+    update.reply = None
+
+
 @pytest.mark.parametrize("version", ["../2.2.0", "2.0", "2.0.0-rc1", None, "999999.0.0"])
 def test_invalid_versions(version):
     with pytest.raises(ValueError): version_tuple(version)
@@ -139,6 +151,7 @@ def test_launch_only_verified_and_enabled_update(tmp_path, monkeypatch):
     with patch("updates.application_root", return_value=tmp_path), patch("updates.subprocess.Popen") as process:
         assert launch_pending_update(restart=True, files=["C:/문서 [1].pdf"])
         assert "/restart" in process.call_args.args[0] and process.call_args.args[0][-1] == "C:/문서 [1].pdf"
+        assert all(process.call_args.kwargs[key] == subprocess.DEVNULL for key in ["stdin","stdout","stderr"])
         (tmp_path / "settings.json").write_text('{"automatic_updates":false}')
         assert not launch_pending_update(); assert process.call_count == 1
         (tmp_path / "settings.json").write_text('{}'); path.write_bytes(b"tampered")

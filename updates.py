@@ -105,7 +105,10 @@ def launch_pending_update(restart=False, files=None):
         for path in files or []:
             command.extend(["/open", str(path)])
     try:
+        # A child must not keep the launcher's redirected output pipes open:
+        # the installer waits for that launcher to exit before replacing it.
         subprocess.Popen(command, cwd=str(installer.parent), close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return True
     except OSError as error:
@@ -165,7 +168,7 @@ class UpdateManager(QObject):
 
     def _redirected(self, url):
         if url.scheme() == "https" and url.host() in REDIRECT_HOSTS:
-            self.reply.redirectAllowed()
+            self.reply.redirectAllowed.emit()
         else:
             self.network_error = "업데이트 파일의 다운로드 주소를 확인할 수 없습니다."
             self.reply.abort()
