@@ -1,0 +1,284 @@
+// S.PDF Web. SPDX-License-Identifier: AGPL-3.0-or-later
+import {icons} from './icons.mjs';
+
+const $=selector=>document.querySelector(selector), $$=selector=>[...document.querySelectorAll(selector)];
+const BUILD=document.querySelector('meta[name="spdf-build"]')?.content||'development';
+const esc=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const prettySize=bytes=>bytes<1048576?`${(bytes/1024).toFixed(0)} KB`:`${(bytes/1048576).toFixed(1)} MB`;
+const basename=name=>name.replace(/\.pdf$/i,'');
+const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
+let settings={theme:'light',recovery:true};
+try{settings={...settings,...JSON.parse(localStorage.getItem('spdf-settings')||'{}')};}catch{}
+const state={tabs:[],active:null,mode:'view',tool:'hand',side:'pages',busy:false,scope:'region',textMode:'replace',compare:null,dragDepth:0,cancel:false};
+const current=()=>state.tabs.find(tab=>tab.id===state.active);
+let request=0,toastTimer,readyResolve,readyReject,dialogResolve,renderSequence=0,thumbnailObserver;
+const pending=new Map(), thumbnailCache=new Map();
+const engineReady=new Promise((resolve,reject)=>{readyResolve=resolve;readyReject=reject;});
+const worker=new Worker(new URL(`pdf-worker.mjs?v=${BUILD}`,import.meta.url),{type:'module'});
+
+function iconMarkup(name){return (icons[name]||icons['file-text']||'').replace('<svg ','<svg class="icon" aria-hidden="true" ');}
+function fillIcons(root=document){root.querySelectorAll('[data-icon]').forEach(element=>{element.innerHTML=iconMarkup(element.dataset.icon);});}
+fillIcons();
+function status(text){$('#status').textContent=text;}
+function toast(text){clearTimeout(toastTimer);$('#toast').textContent=text;$('#toast').hidden=false;toastTimer=setTimeout(()=>$('#toast').hidden=true,6500);}
+function errorMessage(error){console.error(error);toast(error.message||String(error));status(error.message||'작업을 완료하지 못했습니다.');}
+worker.onmessage=event=>{
+  const data=event.data;
+  if(data.ready){readyResolve();status('준비 완료 · PDF는 내 기기에서 처리합니다.');updateControls();return;}
+  if(data.progress){if(state.busy){$('#task-detail').textContent=`${data.progress.label} · ${data.progress.current} / ${data.progress.total}`;}return;}
+  const entry=pending.get(data.request);if(!entry)return;pending.delete(data.request);
+  if(data.error){const error=Error(data.error.message);error.code=data.error.code;entry.reject(error);}else entry.resolve(data.result);
+};
+worker.onerror=event=>{
+  const error=Error('PDF 처리 도구를 불러오지 못했습니다. 페이지를 새로고침해주세요.');
+  readyReject(error);for(const item of pending.values())item.reject(error);pending.clear();errorMessage(error);state.busy=false;$('#task-status').hidden=true;
+};
+async function rpc(method,args={},transfer=[]){await engineReady;const id=++request;return new Promise((resolve,reject)=>{pending.set(id,{resolve,reject});worker.postMessage({request:id,method,args},transfer);});}
+async function task(label,fn,{cancellable=false}={}){
+  if(state.busy){toast('진행 중인 작업을 마친 뒤 다시 시도해주세요.');return;}
+  state.busy=true;state.cancel=false;$('#task-label').textContent=label;$('#task-detail').textContent='';$('#task-status').hidden=false;$('#cancel-task').hidden=!cancellable;updateControls();
+  try{return await fn();}catch(error){errorMessage(error);}finally{state.busy=false;$('#task-status').hidden=true;updateControls();}
+}
+$('#cancel-task').onclick=()=>{state.cancel=true;$('#task-detail').textContent='현재 페이지 작업을 마친 뒤 중지합니다.';};
+function updateControls(){
+  const tab=current();const enabled=!!tab&&!state.busy;
+  $$('.document-action').forEach(button=>button.disabled=!enabled);
+  $('#merge-button').disabled=state.busy;
+  $('#undo').disabled=!enabled||!tab?.undo;$('#redo').disabled=!enabled||!tab?.redo;
+  for(const id of ['previous-page','next-page','page-number','zoom-in','zoom-out','zoom-value','fit-page'])$('#'+id).disabled=!enabled;
+  if(tab){$('#page-number').value=tab.page+1;$('#page-total').textContent=`/ ${tab.count}`;$('#previous-page').disabled=!enabled||tab.page===0;$('#next-page').disabled=!enabled||tab.page>=tab.count-1;$('#zoom-value').textContent=tab.fit?'화면 맞춤':`${Math.round(tab.zoom*100)}%`;}
+  else{$('#page-number').value=1;$('#page-total').textContent='/ 0';$('#zoom-value').textContent='100%';}
+  updatePageSummary();
+}
+function setTheme(value){settings.theme=value;const dark=value==='dark'||value==='system'&&matchMedia('(prefers-color-scheme:dark)').matches;document.documentElement.dataset.theme=dark?'dark':'light';saveSettings();}
+function saveSettings(){try{localStorage.setItem('spdf-settings',JSON.stringify(settings));}catch{}}
+setTheme(settings.theme);matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>{if(settings.theme==='system')setTheme('system');});
+
+function fieldValues(){const values={};$('#dialog-body').querySelectorAll('[data-field]').forEach(input=>values[input.dataset.field]=input.type==='checkbox'?input.checked:input.value);return values;}
+function closeDialog(choice=null){const values=fieldValues();$('#dialog').close();const resolve=dialogResolve;dialogResolve=null;resolve?.({choice,values});}
+async function ask(title,body,buttons=[['cancel','취소'],['ok','확인']],setup=null){
+  if(dialogResolve)closeDialog(null);
+  $('#dialog-title').textContent=title;$('#dialog-body').innerHTML=body;$('#dialog-actions').replaceChildren();
+  for(const [id,text,primary] of buttons){const button=document.createElement('button');button.type='button';button.className='button'+(primary?' primary':'');button.textContent=text;button.onclick=()=>closeDialog(id);$('#dialog-actions').append(button);}
+  fillIcons($('#dialog'));const promise=new Promise(resolve=>dialogResolve=resolve);$('#dialog').showModal();setup?.();
+  setTimeout(()=>$('#dialog-body input:not([type=checkbox]),#dialog-body textarea')?.focus(),50);
+  return promise;
+}
+$('#dialog-close').onclick=()=>closeDialog(null);
+$('#dialog').addEventListener('cancel',event=>{event.preventDefault();closeDialog(null);});
+$('#dialog form').onsubmit=event=>{event.preventDefault();$('#dialog-actions .primary')?.click();};
+function parsePages(expression,count){
+  if(!expression||/^(전체|all|\*)$/i.test(expression.trim()))return Array.from({length:count},(_,i)=>i);
+  const output=[];for(const piece of expression.replaceAll('~','-').replaceAll('–','-').split(',')){const m=piece.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);if(!m)throw Error('페이지 범위 예: 1,3-5,8');const a=+m[1],b=+(m[2]||m[1]);if(a<1||b<a||b>count)throw Error(`1~${count}페이지 범위로 입력해주세요.`);for(let p=a-1;p<b;p++)if(!output.includes(p))output.push(p);}return output;
+}
+function download(bytes,name,mime='application/pdf'){
+  const blob=bytes instanceof Blob?bytes:new Blob([bytes],{type:mime});const url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=name;link.click();setTimeout(()=>URL.revokeObjectURL(url),60000);
+}
+async function downloadZip(entries,name){const {zipSync}=await import('./vendor/fflate/browser.js');download(zipSync(entries,{level:0}),name,'application/zip');}
+
+function newTab(meta,{page=0,size=0}={}){
+  const tab={...meta,page:clamp(page,0,meta.count-1),zoom:1,fit:true,size,bounds:[0,0,600,800],selected:new Set(),regions:new Map(),selection:null,textData:null,search:[],scroll:[0,0],imageURL:null,recoverySaved:-1};
+  state.tabs.push(tab);state.active=tab.id;renderTabs();refresh();queueRecovery(tab);return tab;
+}
+function renderTabs(){
+  const list=$('#file-tabs');list.replaceChildren();
+  for(const tab of state.tabs){const element=document.createElement('div');element.className='file-tab'+(tab.id===state.active?' active':'');element.role='tab';element.tabIndex=0;element.ariaSelected=String(tab.id===state.active);element.draggable=true;element.dataset.id=tab.id;element.title=tab.name;
+    element.innerHTML=iconMarkup('file-text');const title=document.createElement('span');title.className='tab-name';title.textContent=tab.name;element.append(title);
+    if(tab.dirty){const dot=document.createElement('span');dot.className='dirty-dot';dot.ariaLabel='저장하지 않은 변경사항';element.append(dot);}
+    const close=document.createElement('button');close.className='tab-close';close.ariaLabel=tab.name+' 닫기';close.innerHTML=iconMarkup('x');close.onclick=event=>{event.stopPropagation();closeTab(tab.id);};element.append(close);
+    element.onclick=()=>activateTab(tab.id);element.onkeydown=event=>{if(event.key==='Enter'||event.key===' ')activateTab(tab.id);};
+    element.ondragstart=event=>event.dataTransfer.setData('application/x-spdf-tab',tab.id);
+    element.ondragover=event=>{if(event.dataTransfer.types.includes('application/x-spdf-tab'))event.preventDefault();};
+    element.ondrop=event=>{const source=event.dataTransfer.getData('application/x-spdf-tab');if(!source)return;event.preventDefault();const from=state.tabs.findIndex(t=>t.id===source),to=state.tabs.findIndex(t=>t.id===tab.id);state.tabs.splice(to,0,state.tabs.splice(from,1)[0]);renderTabs();};list.append(element);
+  }
+  updateControls();
+}
+function rememberScroll(){const tab=current();if(tab)tab.scroll=[$('#primary-scroller').scrollLeft,$('#primary-scroller').scrollTop];}
+function activateTab(id){if(state.active===id)return;rememberScroll();state.active=id;renderTabs();refresh();}
+async function closeTab(id){
+  if(state.busy)return toast('진행 중인 작업을 마친 뒤 닫아주세요.');const tab=state.tabs.find(t=>t.id===id);if(!tab)return;
+  if(tab.dirty){const result=await ask('변경사항이 있습니다',`<p class="hint">${esc(tab.name)}<br>저장하지 않은 작업을 닫을까요?</p>`,[['cancel','계속 작업'],['discard','저장하지 않고 닫기'],['save','먼저 저장',true]]);if(result.choice==='save'){activateTab(id);return saveDocument();}if(result.choice!=='discard')return;}
+  await rpc('close',{id});if(tab.imageURL)URL.revokeObjectURL(tab.imageURL);state.tabs.splice(state.tabs.indexOf(tab),1);await removeRecovery(id);
+  if(state.active===id)state.active=state.tabs.at(-1)?.id||null;if(state.compare===id)state.compare=null;clearThumbnailCache(id);renderTabs();refresh();
+}
+async function openFiles(files){
+  const pdfs=[...files].filter(file=>/\.pdf$/i.test(file.name)||file.type==='application/pdf');if(!pdfs.length)return toast('PDF 파일을 선택해주세요.');
+  await task('PDF 열기',async()=>{
+    for(const file of pdfs){let password='',meta;while(true){const bytes=await file.arrayBuffer();try{meta=await rpc('open',{bytes,name:file.name,password},[bytes]);break;}catch(error){if(error.code!=='PASSWORD')throw error;const answer=await ask('PDF 비밀번호',`<p class="hint">${esc(file.name)}<br>${esc(error.message)}</p><div class="field"><label>비밀번호</label><input type="password" data-field="password" autocomplete="off"></div>`,[['cancel','취소'],['ok','열기',true]]);if(answer.choice!=='ok')break;password=answer.values.password;}}
+      if(meta)newTab(meta,{size:file.size});
+    }
+    status(`${state.tabs.length}개 PDF 열림 · 원본 파일은 그대로 보관됩니다.`);
+  });
+}
+const fileInput=$('#file-input');
+for(const id of ['open-button','add-tab','empty-open'])$('#'+id).onclick=()=>fileInput.click();
+fileInput.onchange=async()=>{const files=[...fileInput.files];fileInput.value='';await openFiles(files);if(mergeContext&&$('#dialog').open)renderMergeList();};
+$('#demo-button').onclick=()=>task('샘플 문서 열기',async()=>{newTab(await rpc('demo'));status('샘플 PDF를 열었습니다. 도구를 눌러 직접 편집해보세요.');});
+
+function setMode(mode){state.mode=mode;$('#app').dataset.mode=mode;$$('.mode').forEach(button=>{const yes=button.dataset.mode===mode;button.classList.toggle('active',yes);button.ariaPressed=String(yes);});$$('[data-context]').forEach(el=>el.hidden=el.dataset.context!==mode);$$('[data-inspector]').forEach(el=>el.hidden=el.dataset.inspector!==mode);$('#inspector').hidden=mode==='view'||!current();$('#workspace').classList.toggle('with-inspector',mode!=='view'&&!!current());if(mode==='pages'&&current()&&!current().selected.size)current().selected.add(current().page);current()&&(current().selection=null);refresh();}
+$$('.mode').forEach(button=>button.onclick=()=>setMode(button.dataset.mode));
+$$('[data-tool]').forEach(button=>button.onclick=()=>{state.tool=button.dataset.tool;$$('[data-tool]').forEach(b=>b.classList.toggle('selected',b===button));$('#page-overlay').dataset.tool=state.tool;});
+function setSide(side){state.side=side;if(innerWidth<800)$('#sidebar').classList.add('mobile-open');$$('[data-side]').forEach(b=>b.classList.toggle('selected',b.dataset.side===side));$('#side-title').textContent={pages:'페이지',bookmarks:'북마크',search:'검색',notes:'주석'}[side];for(const name of ['thumbnail-list','bookmark-panel','search-panel','notes-panel'])$('#'+name).hidden=name!==({pages:'thumbnail-list',bookmarks:'bookmark-panel',search:'search-panel',notes:'notes-panel'}[side]);refreshSide();}
+$$('[data-side]').forEach(button=>button.onclick=()=>setSide(button.dataset.side));
+$('#mobile-nav').onclick=()=>setSide(state.side);$('#sidebar-close').onclick=()=>$('#sidebar').classList.remove('mobile-open');
+
+function applyMeta(meta){const tab=state.tabs.find(t=>t.id===meta.id);if(!tab)return;Object.assign(tab,meta);tab.page=clamp(tab.page,0,tab.count-1);tab.textData=null;tab.selection=null;tab.selected=new Set([...tab.selected].filter(p=>p<tab.count));clearThumbnailCache(tab.id);renderTabs();refresh();queueRecovery(tab);}
+async function history(action){const tab=current();if(tab)await task(action==='undo'?'실행 취소':'다시 실행',async()=>{applyMeta(await rpc('history',{id:tab.id,action}));status(action==='undo'?'실행을 취소했습니다.':'다시 실행했습니다.');});}
+$('#undo').onclick=()=>history('undo');$('#redo').onclick=()=>history('redo');
+function clearThumbnailCache(id){for(const [key,value] of thumbnailCache)if(!id||key.startsWith(id+':')){URL.revokeObjectURL(value);thumbnailCache.delete(key);}}
+function thumbnailKey(tab,page){return `${tab.id}:${tab.revision}:${page}`;}
+async function loadThumbnail(img,tab,index){const key=thumbnailKey(tab,index);if(thumbnailCache.has(key)){img.src=thumbnailCache.get(key);return;}if(img.dataset.loading)return;img.dataset.loading='1';try{const image=await rpc('render',{id:tab.id,page:index,scale:.18});if(!img.isConnected||!state.tabs.includes(tab)||key!==thumbnailKey(tab,index))return;const url=URL.createObjectURL(new Blob([image.bytes],{type:'image/png'}));thumbnailCache.set(key,url);img.src=url;}catch{}finally{delete img.dataset.loading;}}
+function observeThumbnails(root,tab){thumbnailObserver?.disconnect();thumbnailObserver=new IntersectionObserver(entries=>{for(const entry of entries)if(entry.isIntersecting){const img=entry.target;thumbnailObserver.unobserve(img);loadThumbnail(img,tab,+img.dataset.page);}},{root,rootMargin:'200px'});root.querySelectorAll('img[data-page]').forEach(img=>thumbnailObserver.observe(img));}
+function renderThumbnails(){const tab=current(),list=$('#thumbnail-list');list.replaceChildren();if(!tab)return;for(let i=0;i<tab.count;i++){const button=document.createElement('button');button.className='thumbnail'+(tab.page===i?' selected':'');button.ariaLabel=`${i+1}페이지`;button.innerHTML=`<div class="thumbnail-image"><img data-page="${i}" alt="${i+1}페이지 미리보기" loading="lazy"></div><span>${i+1}</span>`;button.onclick=()=>goTo(i);list.append(button);}observeThumbnails($('#side-body'),tab);}
+async function refreshSide(){
+  const tab=current();$('#side-count').textContent=tab?`${tab.count}쪽`:'';if(!tab){$('#thumbnail-list').replaceChildren();$('#bookmark-list').replaceChildren();$('#search-list').replaceChildren();$('#notes-list').replaceChildren();return;}
+  if(state.side==='pages')renderThumbnails();
+  if(state.side==='bookmarks'){const entries=await rpc('bookmarks',{id:tab.id});if(current()!==tab)return;const list=$('#bookmark-list');list.replaceChildren();for(const entry of entries){const row=document.createElement('div');row.className='side-item';row.style.paddingLeft=(entry.level*9)+'px';const button=document.createElement('button');button.textContent=entry.title;button.onclick=()=>goTo(entry.page);const close=document.createElement('button');close.className='icon-button';close.innerHTML=iconMarkup('x');close.ariaLabel='북마크 삭제';close.onclick=()=>task('북마크 삭제',async()=>applyMeta(await rpc('bookmark',{id:tab.id,path:entry.path,remove:true})));row.append(button,close);list.append(row);}if(!entries.length)list.innerHTML='<p class="hint" style="margin-top:14px">북마크를 추가해 필요한 페이지로 빠르게 이동하세요.</p>';}
+  if(state.side==='notes'){const entries=await rpc('annotations',{id:tab.id,page:tab.page});if(current()!==tab)return;const list=$('#notes-list');list.replaceChildren();for(const entry of entries){const row=document.createElement('div');row.className='side-item';const button=document.createElement('button');button.textContent=entry.text||({Square:'사각형',Line:'화살표',Highlight:'강조',Text:'메모'}[entry.type]||entry.type);button.title=entry.text;button.onclick=()=>showSelection(entry.rect,'선택한 주석');const close=document.createElement('button');close.className='icon-button';close.innerHTML=iconMarkup('trash-2');close.ariaLabel='주석 삭제';close.onclick=()=>task('주석 삭제',async()=>applyMeta(await rpc('deleteAnnotation',{id:tab.id,page:tab.page,index:entry.index})));row.append(button,close);list.append(row);}if(!entries.length)list.innerHTML='<p class="hint">이 페이지에는 주석이 없습니다.</p>';}
+}
+let refreshing=false;
+function refresh(){const tab=current();if(state.compare===state.active)state.compare=state.tabs.find(t=>t.id!==state.active)?.id||null;updateCompareSelect();$('#compare-controls').hidden=!state.compare;$('#compare-scroller').hidden=!state.compare;$('#empty-state').hidden=!!tab;$('#view-container').hidden=!tab||state.mode==='pages';$('#gallery').hidden=!tab||state.mode!=='pages';$('#inspector').hidden=!tab||state.mode==='view';$('#workspace').classList.toggle('with-inspector',!!tab&&state.mode!=='view');updateControls();if(!tab){$('#page-image').removeAttribute('src');refreshSide();return;}$('#document-name').textContent=tab.name;refreshSide().catch(errorMessage);if(state.mode==='pages')renderGallery();else renderView().catch(errorMessage);updateCaptureResolution();}
+function displayScale(tab,scroller){if(!tab.fit)return tab.zoom;const w=tab.bounds[2]-tab.bounds[0],h=tab.bounds[3]-tab.bounds[1];return Math.max(.05,Math.min((scroller.clientWidth-52)/w,(scroller.clientHeight-55)/h,2));}
+async function renderView(){
+  const tab=current();if(!tab)return;const sequence=++renderSequence,scroller=$('#primary-scroller');
+  const text=await rpc('text',{id:tab.id,page:tab.page});if(sequence!==renderSequence||current()!==tab)return;
+  tab.textData=text;tab.bounds=text.bounds;tab.displayScale=displayScale(tab,scroller);
+  const ratio=Math.min(devicePixelRatio||1,2),scale=tab.displayScale*ratio;
+  const image=await rpc('render',{id:tab.id,page:tab.page,scale});if(sequence!==renderSequence||current()!==tab)return;
+  const width=(tab.bounds[2]-tab.bounds[0])*tab.displayScale,height=(tab.bounds[3]-tab.bounds[1])*tab.displayScale;
+  $('#paper').style.width=width+'px';$('#paper').style.height=height+'px';
+  const url=URL.createObjectURL(new Blob([image.bytes],{type:'image/png'}));if(tab.imageURL)URL.revokeObjectURL(tab.imageURL);tab.imageURL=url;$('#page-image').src=url;$('#page-overlay').dataset.tool=state.tool;
+  $('#document-dimensions').textContent=`${Math.round(tab.bounds[2]-tab.bounds[0])} × ${Math.round(tab.bounds[3]-tab.bounds[1])} pt`;
+  requestAnimationFrame(()=>{scroller.scrollLeft=tab.scroll[0];scroller.scrollTop=tab.scroll[1];});
+  drawSearchHighlights();if(state.mode==='capture'&&state.scope==='region'&&tab.regions.has(tab.page))showSelection(tab.regions.get(tab.page),'선택 영역');else if(state.mode==='text'&&tab.selection)showSelection(tab.selection.rect,'글자 편집');else hideSelection();
+  updateCaptureResolution();updateControls();await renderCompare(sequence);
+}
+async function renderCompare(sequence=renderSequence){
+  const other=state.tabs.find(t=>t.id===state.compare);$('#compare-controls').hidden=!other;$('#compare-scroller').hidden=!other;$('#papers').classList.toggle('comparing',!!other);if(!other)return;
+  const active=current();const page=$('#compare-sync').checked?clamp(active.page,0,other.count-1):clamp((+$('#compare-page').value||1)-1,0,other.count-1);$('#compare-page').value=page+1;
+  const info=await rpc('text',{id:other.id,page});if(sequence!==renderSequence)return;const view={...other,bounds:info.bounds,fit:active.fit,zoom:active.zoom};const scale=displayScale(view,$('#compare-scroller'));
+  const image=await rpc('render',{id:other.id,page,scale:scale*Math.min(devicePixelRatio||1,2)});if(sequence!==renderSequence)return;
+  const element=$('#compare-image');if(element.dataset.url)URL.revokeObjectURL(element.dataset.url);const url=URL.createObjectURL(new Blob([image.bytes],{type:'image/png'}));element.dataset.url=url;element.src=url;element.parentElement.style.width=((info.bounds[2]-info.bounds[0])*scale)+'px';element.parentElement.style.height=((info.bounds[3]-info.bounds[1])*scale)+'px';
+}
+function goTo(page){const tab=current();if(!tab)return;tab.page=clamp(page,0,tab.count-1);tab.scroll=[0,0];tab.selection=null;$('#sidebar').classList.remove('mobile-open');refresh();}
+$('#previous-page').onclick=()=>goTo(current().page-1);$('#next-page').onclick=()=>goTo(current().page+1);$('#page-number').onchange=()=>goTo((+$('#page-number').value||1)-1);
+function zoom(factor){const tab=current();if(!tab)return;tab.zoom=clamp((tab.fit?tab.displayScale:tab.zoom)*factor,.1,5);tab.fit=false;renderView().catch(errorMessage);}
+$('#zoom-in').onclick=()=>zoom(1.2);$('#zoom-out').onclick=()=>zoom(1/1.2);$('#zoom-value').onclick=()=>{current().fit=false;current().zoom=1;renderView();};$('#fit-page').onclick=()=>{if(current()){current().fit=true;renderView();}};
+$('#primary-scroller').addEventListener('scroll',()=>{rememberScroll();if(state.compare&&$('#compare-sync').checked){const a=$('#primary-scroller'),b=$('#compare-scroller');const ratio=a.scrollTop/Math.max(1,a.scrollHeight-a.clientHeight);b.scrollTop=ratio*Math.max(0,b.scrollHeight-b.clientHeight);}},{passive:true});
+$('#document-stage').addEventListener('wheel',event=>{if(event.ctrlKey){event.preventDefault();zoom(event.deltaY<0?1.1:1/1.1);}},{passive:false});
+let resizeTimer;new ResizeObserver(()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{if(current()?.fit&&state.mode!=='pages')renderView().catch(errorMessage);},160);}).observe($('#document-stage'));
+
+function paperPoint(event){const tab=current(),box=$('#page-overlay').getBoundingClientRect();return [clamp((event.clientX-box.left)/tab.displayScale+tab.bounds[0],tab.bounds[0],tab.bounds[2]),clamp((event.clientY-box.top)/tab.displayScale+tab.bounds[1],tab.bounds[1],tab.bounds[3])];}
+function hideSelection(){$('#selection-box').hidden=true;}
+function showSelection(rect,label='선택'){const tab=current();if(!tab)return;const box=$('#selection-box');box.hidden=false;box.style.left=((rect[0]-tab.bounds[0])*tab.displayScale)+'px';box.style.top=((rect[1]-tab.bounds[1])*tab.displayScale)+'px';box.style.width=((rect[2]-rect[0])*tab.displayScale)+'px';box.style.height=((rect[3]-rect[1])*tab.displayScale)+'px';$('#selection-label').textContent=label;}
+let pointer=null;
+$('#page-overlay').onpointerdown=event=>{if(!current()||state.busy)return;const point=paperPoint(event);pointer={point,x:event.clientX,y:event.clientY,scroll:[$('#primary-scroller').scrollLeft,$('#primary-scroller').scrollTop]};event.currentTarget.setPointerCapture(event.pointerId);};
+$('#page-overlay').onpointermove=event=>{if(!pointer)return;if(state.mode==='view'&&state.tool==='hand'){const scroller=$('#primary-scroller');scroller.scrollLeft=pointer.scroll[0]-(event.clientX-pointer.x);scroller.scrollTop=pointer.scroll[1]-(event.clientY-pointer.y);return;}const point=paperPoint(event),rect=[Math.min(point[0],pointer.point[0]),Math.min(point[1],pointer.point[1]),Math.max(point[0],pointer.point[0]),Math.max(point[1],pointer.point[1])];showSelection(rect,state.mode==='capture'?'선택 영역':'선택');};
+$('#page-overlay').onpointerup=async event=>{
+  if(!pointer)return;const start=pointer.point,point=paperPoint(event),distance=Math.hypot(event.clientX-pointer.x,event.clientY-pointer.y);pointer=null;const tab=current();
+  const rect=[Math.min(start[0],point[0]),Math.min(start[1],point[1]),Math.max(start[0],point[0]),Math.max(start[1],point[1])];
+  try{
+    if(state.mode==='capture'){if(state.scope==='region'&&distance>4){tab.regions.set(tab.page,rect);showSelection(rect,'선택 영역');updateCaptureResolution();}return;}
+    if(state.mode==='text'){
+      if(state.textMode==='replace'&&distance<5){const line=tab.textData?.lines.find(line=>point[0]>=line.rect[0]-3&&point[0]<=line.rect[2]+3&&point[1]>=line.rect[1]-3&&point[1]<=line.rect[3]+3);if(!line){hideSelection();return toast('글자가 있는 한 줄을 선택해주세요. 스캔 PDF는 문자 인식을 먼저 실행하세요.');}if(line.wmode||Math.abs(line.dir[1])>.02)return toast('가로로 놓인 글자 한 줄을 선택해주세요. 회전된 글자는 추가 도구를 사용할 수 있습니다.');tab.selection=line;$('#replacement-text').value=line.text;$('#text-size').value=Math.round(line.size*10)/10;showSelection(line.rect,'기존 글자 수정');}
+      else if(distance>5){tab.selection={rect,origin:[rect[0],rect[1]+(+$('#text-size').value||12)]};showSelection(rect,state.textMode==='add'?'새 글자 영역':'선택 영역');}
+      else if(state.textMode==='add'){const size=+$('#text-size').value||12;tab.selection={rect:[point[0],point[1],Math.min(tab.bounds[2]-10,point[0]+250),point[1]+size*1.6],origin:[point[0],point[1]+size]};showSelection(tab.selection.rect,'새 글자 영역');}return;
+    }
+    if(state.tool==='hand'){hideSelection();return;}
+    if(state.tool==='select'){if(distance>4){const text=await rpc('copyText',{id:tab.id,page:tab.page,rect});if(text){await navigator.clipboard.writeText(text);toast('선택한 글자를 복사했습니다.');}else toast('선택 영역에서 글자를 찾지 못했습니다.');}return;}
+    if(state.tool==='Text'){const answer=await ask('메모 추가','<div class="field"><label>메모 내용</label><textarea data-field="text" rows="4"></textarea></div>',[['cancel','취소'],['ok','추가',true]]);if(answer.choice!=='ok'||!answer.values.text.trim())return;const noteRect=[point[0],point[1],point[0]+24,point[1]+24];await task('메모 추가',async()=>applyMeta(await rpc('annotate',{id:tab.id,page:tab.page,type:'Text',rect:noteRect,color:$('#annotation-color').value,text:answer.values.text})));}
+    else if(distance>5)await task('주석 추가',async()=>applyMeta(await rpc('annotate',{id:tab.id,page:tab.page,type:state.tool,rect,color:$('#annotation-color').value})));
+  }catch(error){errorMessage(error);}
+};
+$('#page-overlay').onpointercancel=()=>pointer=null;
+
+function captureRect(tab=current()){return state.scope==='page'?null:tab?.regions.get(tab.page)||null;}
+function updateCaptureResolution(){const tab=current();if(!tab)return;const rect=captureRect(tab);if(state.scope==='region'&&!rect){$('#capture-resolution').textContent='영역을 선택해주세요';return;}const area=rect||tab.bounds,scale=+$('#capture-dpi').value/72;const width=Math.ceil(area[2]*scale)-Math.floor(area[0]*scale),height=Math.ceil(area[3]*scale)-Math.floor(area[1]*scale);$('#capture-resolution').textContent=`${width.toLocaleString()} × ${height.toLocaleString()} px`;$('#capture-size-hint').textContent=width*height>60_000_000?'출력 크기가 큽니다. 해상도를 낮춰주세요.':'원본 품질에 따라 선명도가 달라집니다.';}
+$$('[data-capture-scope]').forEach(button=>button.onclick=()=>{state.scope=button.dataset.captureScope;$$('[data-capture-scope]').forEach(b=>b.classList.toggle('selected',b===button));if(state.scope==='page')hideSelection();else if(current()?.regions.has(current().page))showSelection(captureRect(),'선택 영역');updateCaptureResolution();});
+$('#capture-dpi').onchange=updateCaptureResolution;$('#clear-capture').onclick=()=>{current()?.regions.delete(current().page);hideSelection();updateCaptureResolution();};
+async function captureImage(tab=current(),page=tab?.page,rect=undefined,format=$('#capture-format').value){if(!tab)throw Error('PDF를 먼저 열어주세요.');if(rect===undefined){rect=captureRect(tab);if(state.scope==='region'&&!rect)throw Error('캡처할 영역을 먼저 선택해주세요.');}return rpc('render',{id:tab.id,page,scale:+$('#capture-dpi').value/72,clip:rect,format});}
+$('#capture-save').onclick=()=>task('고화질 이미지 만들기',async()=>{const tab=current(),format=$('#capture-format').value,image=await captureImage();download(image.bytes,`${basename(tab.name)}_${tab.page+1}페이지.${format}`,format==='png'?'image/png':'image/jpeg');status(`${image.width.toLocaleString()} × ${image.height.toLocaleString()} px 이미지 다운로드를 시작했습니다.`);});
+$('#capture-copy').onclick=async()=>{if(state.busy)return;if(!navigator.clipboard?.write||!globalThis.ClipboardItem)return toast('이 브라우저에서는 이미지 복사를 지원하지 않습니다. 이미지 저장을 사용해주세요.');const tab=current();if(!tab)return;try{const blob=captureImage(tab,tab.page,undefined,'png').then(image=>new Blob([image.bytes],{type:'image/png'}));await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);toast('고화질 이미지를 클립보드에 복사했습니다.');}catch(error){errorMessage(error);}};
+$('#capture-batch').onclick=()=>task('여러 페이지 캡처',async()=>{const tab=current();if(!tab)return;const pages=parsePages($('#capture-pages').value||String(tab.page+1),tab.count),base=captureRect(tab);if(state.scope==='region'&&!base)throw Error('기준이 될 캡처 영역을 먼저 선택해주세요.');const b=tab.bounds,norm=base?[(base[0]-b[0])/(b[2]-b[0]),(base[1]-b[1])/(b[3]-b[1]),(base[2]-b[0])/(b[2]-b[0]),(base[3]-b[1])/(b[3]-b[1])]:null;const entries={},format=$('#capture-format').value;let total=0;
+  for(let i=0;i<pages.length;i++){if(state.cancel)break;const p=pages[i],info=await rpc('text',{id:tab.id,page:p}),bounds=info.bounds,rect=norm?[bounds[0]+norm[0]*(bounds[2]-bounds[0]),bounds[1]+norm[1]*(bounds[3]-bounds[1]),bounds[0]+norm[2]*(bounds[2]-bounds[0]),bounds[1]+norm[3]*(bounds[3]-bounds[1])]:null;const image=await captureImage(tab,p,rect);entries[`${String(p+1).padStart(4,'0')}_capture.${format}`]=image.bytes;total+=image.bytes.length;if(total>300*1048576)throw Error('이미지 합계가 큽니다. 페이지 범위를 나누어 캡처해주세요.');$('#task-detail').textContent=`${i+1} / ${pages.length}페이지`;}
+  if(Object.keys(entries).length){await downloadZip(entries,basename(tab.name)+'_캡처.zip');toast(`${Object.keys(entries).length}개 이미지의 ZIP 다운로드를 시작했습니다.`);}
+},{cancellable:true});
+
+function renderGallery(){const tab=current(),gallery=$('#gallery');gallery.replaceChildren();if(!tab)return;for(let p=0;p<tab.count;p++){const card=document.createElement('article');card.className='page-card'+(tab.selected.has(p)?' selected':'');card.draggable=true;card.dataset.page=p;card.innerHTML=`<div class="page-sheet"><img data-page="${p}" alt="${p+1}페이지 미리보기" loading="lazy"></div><div class="page-caption"><label><input type="checkbox" ${tab.selected.has(p)?'checked':''} aria-label="${p+1}페이지 선택"><span>${p+1}페이지</span></label><button class="icon-button" aria-label="${p+1}페이지 열기">${iconMarkup('maximize')}</button></div>`;
+    card.querySelector('input').onchange=event=>{if(event.target.checked)tab.selected.add(p);else tab.selected.delete(p);card.classList.toggle('selected',tab.selected.has(p));updatePageSummary();};card.querySelector('button').onclick=()=>{tab.page=p;setMode('view');};card.querySelector('.page-sheet').onclick=()=>card.querySelector('input').click();card.ondragstart=event=>event.dataTransfer.setData('application/x-spdf-page',String(p));card.ondragover=event=>{if(event.dataTransfer.types.includes('application/x-spdf-page')){event.preventDefault();card.classList.add('drag-over');}};card.ondragleave=()=>card.classList.remove('drag-over');card.ondrop=event=>{const source=event.dataTransfer.getData('application/x-spdf-page');if(source==='')return;event.preventDefault();const order=Array.from({length:tab.count},(_,i)=>i);order.splice(p,0,order.splice(+source,1)[0]);changePageOrder(order);};gallery.append(card);}observeThumbnails(gallery,tab);updatePageSummary();}
+function updatePageSummary(){const tab=current();$('#selected-summary').textContent=tab?`${tab.selected.size} / ${tab.count}페이지 선택`:'페이지를 선택해주세요.';}
+$('#select-all-pages').onclick=()=>{const tab=current();if(tab){tab.selected=new Set(Array.from({length:tab.count},(_,i)=>i));renderGallery();}};$('#deselect-pages').onclick=()=>{if(current()){current().selected.clear();renderGallery();}};
+function selectedPages(){const tab=current();if(!tab)throw Error('PDF를 먼저 열어주세요.');const pages=[...tab.selected].sort((a,b)=>a-b);if(!pages.length)throw Error('페이지를 선택해주세요.');return pages;}
+$('#rotate-pages').onclick=()=>task('페이지 회전',async()=>{const tab=current();applyMeta(await rpc('editPages',{id:tab.id,action:'rotate',pages:selectedPages()}));});
+async function changePageOrder(order){const tab=current(),oldPage=tab.page;await task('페이지 순서 변경',async()=>{const meta=await rpc('editPages',{id:tab.id,action:'reorder',order});tab.page=order.indexOf(oldPage);tab.selected.clear();applyMeta(meta);});}
+for(const [id,direction] of [['move-pages-left',-1],['move-pages-right',1]])$('#'+id).onclick=()=>{try{const tab=current(),selected=selectedPages(),order=Array.from({length:tab.count},(_,i)=>i);for(const p of direction<0?selected:[...selected].reverse()){const index=order.indexOf(p),next=index+direction;if(next>=0&&next<order.length&&!tab.selected.has(order[next]))[order[index],order[next]]=[order[next],order[index]];}changePageOrder(order);}catch(error){errorMessage(error);}};
+$('#delete-pages').onclick=async()=>{try{const tab=current(),pages=selectedPages();if(pages.length>=tab.count)return toast('문서에는 한 페이지 이상 남겨주세요.');const answer=await ask('페이지 삭제',`<p class="hint">선택한 ${pages.length}페이지를 작업 문서에서 삭제할까요?<br>실행 취소로 되돌릴 수 있습니다.</p>`,[['cancel','취소'],['ok','페이지 삭제',true]]);if(answer.choice==='ok')await task('페이지 삭제',async()=>{tab.selected.clear();applyMeta(await rpc('editPages',{id:tab.id,action:'delete',pages}));});}catch(error){errorMessage(error);}};
+$('#extract-pages').onclick=()=>task('선택 페이지 추출',async()=>{const tab=current(),pages=selectedPages(),bytes=await rpc('extract',{id:tab.id,pages});download(bytes,basename(tab.name)+'_추출.pdf');toast(`${pages.length}페이지 PDF 다운로드를 시작했습니다.`);});
+$('#split-pages').onclick=()=>task('PDF 나누기',async()=>{const tab=current();if(!tab)return;const count=Math.max(1,Math.floor(+$('#split-count').value||1)),entries={};for(let start=0;start<tab.count;start+=count){if(state.cancel)break;const pages=Array.from({length:Math.min(count,tab.count-start)},(_,i)=>start+i);entries[`${basename(tab.name)}_${start+1}-${start+pages.length}.pdf`]=await rpc('extract',{id:tab.id,pages});$('#task-detail').textContent=`${Math.min(start+count,tab.count)} / ${tab.count}페이지`;}if(Object.keys(entries).length)await downloadZip(entries,basename(tab.name)+'_나누기.zip');},{cancellable:true});
+
+let mergeContext=null;
+function renderMergeList(){if(!mergeContext)return;const list=$('#merge-list');if(!list)return;const order=mergeContext.order;for(const tab of state.tabs)if(!order.includes(tab.id))order.push(tab.id);list.replaceChildren();for(const id of order){const tab=state.tabs.find(t=>t.id===id);if(!tab)continue;const row=document.createElement('div');row.className='merge-item';row.innerHTML=`<label><input type="checkbox" data-field="merge-${id}" ${mergeContext.checked.has(id)?'checked':''}><span>${esc(tab.name)}</span></label><button type="button" class="icon-button" data-move="-1" aria-label="위로">${iconMarkup('chevron-left')}</button><button type="button" class="icon-button" data-move="1" aria-label="아래로">${iconMarkup('chevron-right')}</button>`;row.querySelector('input').onchange=event=>{if(event.target.checked)mergeContext.checked.add(id);else mergeContext.checked.delete(id);};row.querySelectorAll('[data-move]').forEach(button=>button.onclick=()=>{const from=order.indexOf(id),to=clamp(from+(+button.dataset.move),0,order.length-1);order.splice(to,0,order.splice(from,1)[0]);renderMergeList();});list.append(row);}}
+async function mergeDialog(){
+  if(state.busy)return;mergeContext={order:state.tabs.map(t=>t.id),checked:new Set(state.tabs.map(t=>t.id)),target:state.active};
+  const answer=await ask('PDF 합치기','<p class="hint">합칠 PDF를 선택하고 순서를 정해주세요. 열린 문서의 변경사항도 함께 반영됩니다.</p><div class="merge-list" id="merge-list"></div><button type="button" class="button" id="merge-add">PDF 더 열기</button><div class="field"><label>결과 파일 이름</label><input data-field="name" value="합친 문서.pdf"></div><label class="check-inline"><input type="checkbox" data-field="append">현재 문서 뒤에 덧붙이기</label>',[['cancel','취소'],['ok','PDF 합치기',true]],()=>{renderMergeList();$('#merge-add').onclick=()=>fileInput.click();});
+  const context=mergeContext;mergeContext=null;if(answer.choice!=='ok')return;const ids=context.order.filter(id=>context.checked.has(id)&&state.tabs.some(t=>t.id===id));
+  await task('PDF 합치기',async()=>{const target=answer.values.append?context.target:null;const sources=target?ids.filter(id=>id!==target):ids;if(!sources.length)throw Error('합칠 PDF를 선택해주세요.');const result=await rpc('merge',{ids:sources,name:answer.values.name||'합친 문서.pdf',target});if(target)applyMeta(result);else newTab(result);status('PDF를 합쳤습니다. 새 PDF로 저장해주세요.');});
+}
+$('#merge-button').onclick=mergeDialog;$('#page-merge').onclick=mergeDialog;
+
+async function saveDocument(){const tab=current();if(!tab)return;const answer=await ask('새 PDF로 저장',`<div class="field"><label>파일 이름</label><input data-field="name" value="${esc(basename(tab.name))}_수정본.pdf"></div><label class="check-inline"><input type="checkbox" data-field="setPassword" id="set-save-password">새 비밀번호 설정</label><div class="field"><label>비밀번호 · 선택한 경우에만 적용</label><input type="password" data-field="password" autocomplete="new-password" id="save-password" disabled><p class="hint">비밀번호 설정을 선택하지 않으면 원래 암호 설정을 유지합니다.</p></div>`,[['cancel','취소'],['ok','PDF 다운로드',true]],()=>$('#set-save-password').onchange=()=>$('#save-password').disabled=!$('#set-save-password').checked);
+  if(answer.choice!=='ok')return;await task('PDF 저장',async()=>{const result=await rpc('save',{id:tab.id,mark:true,password:answer.values.setPassword?answer.values.password:null});let name=answer.values.name.trim()||basename(tab.name)+'_수정본.pdf';if(!/\.pdf$/i.test(name))name+='.pdf';download(result.bytes,name);Object.assign(tab,result.meta);renderTabs();queueRecovery(tab);status(`${prettySize(result.bytes.length)} PDF 다운로드를 시작했습니다.`);});}
+$('#save-button').onclick=saveDocument;
+$$('[data-text-mode]').forEach(button=>button.onclick=()=>{state.textMode=button.dataset.textMode;$$('[data-text-mode]').forEach(b=>b.classList.toggle('selected',b===button));if(current())current().selection=null;hideSelection();$('#text-instruction').textContent=state.textMode==='replace'?'문서에서 수정할 한 줄을 선택해주세요.':'문서에서 넣을 위치를 누르거나 영역을 드래그하세요.';$('#replacement-text').value='';});
+$('#replacement-text').addEventListener('input',event=>{event.target.value=event.target.value.replace(/[\r\n]+/g,' ');});
+$('#apply-text').onclick=()=>task('PDF 글자 편집',async()=>{const tab=current();if(!tab?.selection)throw Error('문서에서 수정할 글자나 넣을 영역을 선택해주세요.');const result=await rpc('editText',{id:tab.id,page:tab.page,rect:tab.selection.rect,origin:tab.selection.origin,text:$('#replacement-text').value,size:+$('#text-size').value||12,color:$('#text-color').value,font:$('#text-font').value,replace:state.textMode==='replace',fit:$('#text-fit').checked,clearImage:$('#text-clear-image').checked});applyMeta(result);status('글자를 적용했습니다. 배치를 확인한 뒤 새 PDF로 저장해주세요.');});
+
+$('#search-form').onsubmit=event=>{event.preventDefault();const tab=current();if(!tab)return;task('문서 검색',async()=>{const query=$('#search-input').value;tab.search=await rpc('search',{id:tab.id,query});const list=$('#search-list');list.replaceChildren();for(const hit of tab.search){const item=document.createElement('div');item.className='side-item';const button=document.createElement('button');button.textContent=`${hit.page+1}페이지 · ${hit.quads.length}곳`;button.onclick=()=>goTo(hit.page);item.append(button);list.append(item);}$('#search-status').textContent=`${tab.search.length}페이지에서 찾았습니다.`;if(tab.search.length)goTo(tab.search[0].page);else drawSearchHighlights();});};
+function drawSearchHighlights(){const tab=current(),container=$('#search-highlights');container.replaceChildren();if(!tab)return;const match=tab.search.find(hit=>hit.page===tab.page);for(const group of match?.quads||[])for(const quad of group){const x=Math.min(quad[0],quad[2],quad[4],quad[6]),y=Math.min(quad[1],quad[3],quad[5],quad[7]),x2=Math.max(quad[0],quad[2],quad[4],quad[6]),y2=Math.max(quad[1],quad[3],quad[5],quad[7]);const box=document.createElement('div');box.className='search-hit';box.style.cssText=`left:${(x-tab.bounds[0])*tab.displayScale}px;top:${(y-tab.bounds[1])*tab.displayScale}px;width:${(x2-x)*tab.displayScale}px;height:${(y2-y)*tab.displayScale}px`;container.append(box);}}
+$('#add-bookmark').onclick=async()=>{const tab=current();if(!tab)return;const answer=await ask('북마크 추가',`<div class="field"><label>북마크 이름</label><input data-field="title" value="${tab.page+1}페이지"></div>`,[['cancel','취소'],['ok','추가',true]]);if(answer.choice==='ok')await task('북마크 추가',async()=>applyMeta(await rpc('bookmark',{id:tab.id,page:tab.page,title:answer.values.title})));};
+
+$('#compare-button').onclick=()=>{if(!current())return;if(state.tabs.length<2)return toast('비교할 PDF를 하나 더 열어주세요.');if(state.compare){state.compare=null;refresh();return;}state.compare=state.tabs.find(tab=>tab.id!==state.active).id;updateCompareSelect();refresh();};
+function updateCompareSelect(){const select=$('#compare-document');select.replaceChildren();for(const tab of state.tabs)if(tab.id!==state.active){const option=document.createElement('option');option.value=tab.id;option.textContent=tab.name;option.selected=tab.id===state.compare;select.append(option);}}
+$('#compare-document').onchange=()=>{state.compare=$('#compare-document').value;renderView();};$('#compare-sync').onchange=()=>renderView();$('#compare-page').onchange=()=>renderView();$('#close-compare').onclick=()=>{state.compare=null;refresh();};
+
+async function runOCR(){const tab=current();if(!tab)return;const answer=await ask('문자 인식 · OCR',`<p class="hint">스캔한 페이지에 검색·복사용 글자층을 추가합니다. 원래 페이지의 이미지는 유지합니다.</p><div class="field"><label>인식할 페이지</label><input data-field="pages" value="${tab.page+1}" placeholder="예: 1,3-5 또는 전체"></div><div class="field"><label>언어</label><select data-field="language"><option value="kor+eng">한국어 + 영어</option><option value="eng">영어</option><option value="kor">한국어</option></select></div><label class="check-inline"><input type="checkbox" data-field="force">이미 글자가 있는 페이지도 인식</label><p class="hint">처음 사용할 때 언어 자료를 불러옵니다. PDF와 인식 이미지는 서버에 전송하지 않습니다.</p>`,[['cancel','취소'],['ok','문자 인식 시작',true]]);if(answer.choice!=='ok')return;
+  await task('문자 인식 준비',async()=>{const pages=parsePages(answer.values.pages,tab.count);const module=await import('./vendor/tesseract.js/tesseract.esm.min.js');const tesseract=module.default||module;let ocr,done=0,skipped=0;try{ocr=await tesseract.createWorker(answer.values.language.split('+'),1,{workerPath:new URL('vendor/tesseract.js/worker.min.js',location.href).href,corePath:new URL('vendor/tesseract.js-core/',location.href).href,langPath:new URL('vendor/tessdata/',location.href).href,workerBlobURL:false,gzip:false,logger:message=>{if(state.busy&&message.status==='recognizing text')$('#task-detail').textContent=`문자 읽는 중 · ${Math.round(message.progress*100)}%`;}});await ocr.setParameters({user_defined_dpi:'150'});for(let i=0;i<pages.length;i++){if(state.cancel)break;const page=pages[i],existing=await rpc('text',{id:tab.id,page});if(existing.text.trim()&&!answer.values.force){skipped++;continue;}$('#task-label').textContent=`문자 인식 · ${page+1}페이지`;const image=await rpc('render',{id:tab.id,page,scale:150/72});const result=await ocr.recognize(new Blob([image.bytes],{type:'image/png'}),{pdfTextOnly:true,pdfTitle:'S.PDF OCR'},{pdf:true,text:true});if(state.cancel)break;if(!result.data.pdf||!result.data.text.trim()){skipped++;continue;}const bytes=Uint8Array.from(result.data.pdf);const meta=await rpc('addOverlay',{id:tab.id,page,bytes},[bytes.buffer]);Object.assign(tab,meta);done++;$('#task-detail').textContent=`${i+1} / ${pages.length}페이지`;}
+    clearThumbnailCache(tab.id);renderTabs();refresh();queueRecovery(tab);toast(`${done}페이지 문자 인식 완료${skipped?` · ${skipped}페이지 건너뜀`:''}`);
+  }finally{if(ocr)await ocr.terminate();}},{cancellable:true});
+}
+$('#ocr-button').onclick=runOCR;
+
+async function compressDialog(){const tab=current();if(!tab)return;const answer=await ask('PDF 용량 줄이기','<p class="hint">사진의 해상도와 품질을 조절하며, 글자와 페이지 크기는 유지합니다.</p><div class="field"><label>압축 정도</label><select data-field="preset"><option value="lossless">무손실 · 문서 구조만 정리</option><option value="high">선명하게 · 이미지 긴 변 3500px</option><option value="balanced" selected>균형 · 이미지 긴 변 2400px</option><option value="small">작게 · 이미지 긴 변 1600px</option></select></div><p class="hint">결과를 확인하고 새 파일로 저장합니다. 이미지가 작은 문서는 줄어드는 양이 적을 수 있습니다.</p>',[['cancel','취소'],['ok','압축하고 저장',true]]);if(answer.choice!=='ok')return;
+  await task('PDF 용량 줄이기',async()=>{const presets={high:[3500,90],balanced:[2400,80],small:[1600,65]};if(answer.values.preset!=='lossless'){const [maxDimension,quality]=presets[answer.values.preset];const result=await rpc('compress',{id:tab.id,maxDimension,quality});Object.assign(tab,result.meta);clearThumbnailCache(tab.id);renderTabs();refresh();queueRecovery(tab);}const output=await rpc('save',{id:tab.id,mark:false});download(output.bytes,basename(tab.name)+'_압축.pdf');status(`압축 결과 ${prettySize(output.bytes.length)}${tab.size?` · 원본 ${prettySize(tab.size)}`:''} · 다운로드를 시작했습니다.`);});}
+
+async function printDialog(){const tab=current();if(!tab)return;const answer=await ask('PDF 인쇄',`<div class="field"><label>인쇄할 페이지</label><input data-field="pages" value="전체" placeholder="예: 1,3-5"></div><p class="hint">선택한 페이지를 선명한 이미지로 준비한 뒤 브라우저의 인쇄 창을 엽니다.</p>`,[['cancel','취소'],['ok','인쇄 준비',true]]);if(answer.choice!=='ok')return;
+  const printWindow=window.open('','_blank');if(!printWindow)return toast('인쇄 창을 열 수 없습니다. 이 사이트의 팝업 허용을 확인해주세요.');printWindow.opener=null;printWindow.document.title='S.PDF 인쇄';printWindow.document.body.textContent='인쇄할 페이지를 준비하고 있습니다…';
+  await task('인쇄할 페이지 준비',async()=>{const pages=parsePages(answer.values.pages,tab.count),urls=[],sections=[];let total=0;try{for(let i=0;i<pages.length;i++){if(state.cancel)break;const image=await rpc('render',{id:tab.id,page:pages[i],scale:150/72,format:'jpg',quality:95});total+=image.bytes.length;if(total>300*1048576)throw Error('인쇄 데이터가 큽니다. 페이지 범위를 나눠 인쇄해주세요.');const url=URL.createObjectURL(new Blob([image.bytes],{type:'image/jpeg'}));urls.push(url);sections.push({url,bounds:image.bounds});$('#task-detail').textContent=`${i+1} / ${pages.length}페이지`;}
+    if(state.cancel){printWindow.close();return;}const document=printWindow.document;document.body.replaceChildren();const style=document.createElement('style');style.textContent='body{margin:0;background:#ddd}.p{margin:12px auto;background:white;break-after:page}.p img{display:block;width:100%;height:100%}@media print{body{background:white}.p{margin:0}}';for(let i=0;i<sections.length;i++){const [x,y,x2,y2]=sections[i].bounds;style.textContent+=`@page p${i}{size:${x2-x}pt ${y2-y}pt;margin:0}.p${i}{page:p${i};width:${x2-x}pt;height:${y2-y}pt}`;}document.head.append(style);const loaded=sections.map((section,i)=>new Promise(resolve=>{const page=document.createElement('div');page.className=`p p${i}`;const image=document.createElement('img');image.onload=resolve;image.onerror=resolve;image.src=section.url;page.append(image);document.body.append(page);}));await Promise.all(loaded);printWindow.onafterprint=()=>urls.forEach(url=>URL.revokeObjectURL(url));printWindow.focus();printWindow.print();status('브라우저 인쇄 창을 열었습니다.');
+  }catch(error){urls.forEach(url=>URL.revokeObjectURL(url));printWindow.close();throw error;}},{cancellable:true});
+}
+$('#print-button').onclick=printDialog;
+
+let recoveryDB;
+async function database(){if(recoveryDB)return recoveryDB;if(!globalThis.indexedDB)throw Error('이 브라우저에서는 자동 복구 저장소를 사용할 수 없습니다.');recoveryDB=await new Promise((resolve,reject)=>{const request=indexedDB.open('spdf-web',1);request.onupgradeneeded=()=>request.result.createObjectStore('documents',{keyPath:'id'});request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);});return recoveryDB;}
+async function storeRequest(mode,action){const db=await database();return new Promise((resolve,reject)=>{const transaction=db.transaction('documents',mode),store=transaction.objectStore('documents');const request=action(store);transaction.oncomplete=()=>resolve(request.result);transaction.onerror=()=>reject(transaction.error);transaction.onabort=()=>reject(transaction.error);});}
+async function removeRecovery(id){try{await storeRequest('readwrite',store=>store.delete(id));}catch{}}
+function queueRecovery(tab){if(!settings.recovery||!state.tabs.includes(tab))return;clearTimeout(tab.recoveryTimer);tab.recoveryTimer=setTimeout(()=>{if(state.busy){queueRecovery(tab);return;}saveRecovery(tab).catch(error=>{console.warn('Recovery save failed',error.message);status('자동 복구 사본을 저장하지 못했습니다. PDF를 직접 저장해주세요.');});},4000);}
+async function saveRecovery(tab){if(!settings.recovery||!state.tabs.includes(tab)||state.busy)return;if(tab.recoverySaved===tab.revision)return;const revision=tab.revision;const result=await rpc('save',{id:tab.id,mark:false});if(!state.tabs.includes(tab))return;await storeRequest('readwrite',store=>store.put({id:tab.id,name:tab.name,bytes:new Blob([result.bytes],{type:"application/pdf"}),page:tab.page,dirty:tab.dirty,updated:Date.now()}));if(tab.revision===revision)tab.recoverySaved=revision;}
+async function offerRecovery(){if(!settings.recovery)return;try{const records=await storeRequest('readonly',store=>store.getAll());if(!records.length)return;const result=await ask('이전 작업이 남아 있습니다',`<p class="hint">이 브라우저에 보관한 PDF ${records.length}개를 다시 열까요?</p>${records.slice(0,6).map(item=>`<div class="recovery-item">${iconMarkup('file-text')}<span>${esc(item.name)}</span></div>`).join('')}`, [['later','나중에'],['clear','보관 사본 삭제'],['ok','작업 복구',true]]);if(result.choice==='clear'){await storeRequest('readwrite',store=>store.clear());return;}if(result.choice==='ok')await task('이전 작업 복구',async()=>{for(const record of records){let password='';while(true){const bytes=record.bytes instanceof Blob?new Uint8Array(await record.bytes.arrayBuffer()):record.bytes.slice();try{const meta=await rpc('open',{bytes,name:record.name,recovered:record.dirty,password},[bytes.buffer]);const tab=newTab(meta,{page:record.page,size:record.bytes.size||record.bytes.length});await removeRecovery(record.id);queueRecovery(tab);break;}catch(error){if(error.code!=='PASSWORD')throw error;const answer=await ask('복구 문서 비밀번호',`<p class="hint">${esc(record.name)}</p><div class="field"><input type="password" data-field="password" autocomplete="off" aria-label="PDF 비밀번호"></div>`,[['cancel','건너뛰기'],['ok','열기',true]]);if(answer.choice!=='ok')break;password=answer.values.password;}}}});}catch(error){console.warn('Recovery unavailable',error.message);}}
+
+async function settingsDialog(){const answer=await ask('S.PDF 설정과 사용 방법',`<div class="dialog-row"><span>화면</span><select data-field="theme"><option value="light" ${settings.theme==='light'?'selected':''}>밝은 화면</option><option value="dark" ${settings.theme==='dark'?'selected':''}>어두운 화면</option><option value="system" ${settings.theme==='system'?'selected':''}>기기 설정에 맞춤</option></select></div><label class="check-inline"><input type="checkbox" data-field="recovery" ${settings.recovery?'checked':''}>이 브라우저에 작업 복구 사본 보관</label><p class="hint">복구 사본은 이 기기의 브라우저 저장소에 남습니다. 공용 컴퓨터에서는 끄고 사용하세요. 비밀번호가 있는 PDF는 복구할 때 다시 입력해야 합니다.</p><hr><div class="settings-section"><h3>문서 도구</h3><button type="button" class="button" id="settings-compress">PDF 용량 줄이기</button><button type="button" class="button" id="settings-ocr">문자 인식 · OCR</button><button type="button" class="button" id="settings-bookmarks">북마크와 검색 열기</button></div><hr><div class="help-keys"><span><b>Ctrl+O</b> PDF 열기</span><span><b>Ctrl+S</b> 새 PDF로 저장</span><span><b>Ctrl+Z / Ctrl+Y</b> 취소 / 다시 실행</span><span><b>Ctrl+F</b> 문서 검색</span><span><b>Ctrl+P</b> 인쇄</span><span><b>Ctrl+휠</b> 확대 / 축소</span></div><p class="hint">S.PDF Web 3.0.0 · ${esc(BUILD.slice(0,8))}<br>여러 PDF를 브라우저에서 처리합니다. 파일을 닫기 전에 필요한 결과를 다운로드해주세요.</p><div class="settings-links"><a href="https://github.com/JUNGHANGEUL/s-pdf/tree/main/web" target="_blank" rel="noreferrer">소스와 라이선스</a><button type="button" class="context-button" id="check-update">새 버전 확인</button></div>`,[['clear','복구 사본 삭제'],['ok','설정 저장',true]],()=>{
+    $('#settings-compress').onclick=()=>{closeDialog('tool');compressDialog();};$('#settings-ocr').onclick=()=>{closeDialog('tool');runOCR();};$('#settings-bookmarks').onclick=()=>{closeDialog('tool');setSide('bookmarks');};$('#check-update').onclick=()=>checkUpdate(true);
+  });if(answer.choice==='ok'){settings.recovery=answer.values.recovery;setTheme(answer.values.theme);saveSettings();if(!settings.recovery)await storeRequest('readwrite',store=>store.clear());else if(current())queueRecovery(current());}if(answer.choice==='clear'){await storeRequest('readwrite',store=>store.clear());toast('이 브라우저의 복구 사본을 삭제했습니다.');}}
+$('#settings-button').onclick=()=>settingsDialog().catch(errorMessage);
+async function checkUpdate(manual=false){try{const response=await fetch(new URL('version.json',location.href),{cache:'no-store'});if(!response.ok)return;const remote=await response.json();if(remote.build!==BUILD&&BUILD!=='development'){if(!$('#update-banner')){const banner=document.createElement('div');banner.id='update-banner';banner.className='reload-banner';banner.innerHTML='<span>새 버전이 준비되었습니다.</span><button class="button" id="reload-version">새로고침</button>';$('#app').prepend(banner);$('#reload-version').onclick=async()=>{if(state.tabs.some(tab=>tab.dirty)&&!confirm('저장하지 않은 PDF가 있습니다. 필요한 결과를 다운로드한 뒤 새로고침해주세요. 계속할까요?'))return;location.reload();};}if(manual)toast('새 버전이 있습니다. 작업을 저장하고 새로고침해주세요.');}else if(manual)toast('현재 최신 웹 버전입니다.');}catch{if(manual)toast('새 버전을 확인하지 못했습니다. 인터넷 연결을 확인해주세요.');}}
+window.addEventListener('focus',()=>checkUpdate());
+window.addEventListener('beforeunload',event=>{if(state.tabs.some(tab=>tab.dirty)){event.preventDefault();event.returnValue='';}});
+window.addEventListener('keydown',event=>{const edit=event.target.matches('input,textarea,select,[contenteditable=true]');if((event.ctrlKey||event.metaKey)&&!event.altKey){const key=event.key.toLowerCase();if(key==='o'){event.preventDefault();fileInput.click();}else if(key==='s'){event.preventDefault();saveDocument();}else if(key==='f'){event.preventDefault();setSide('search');$('#search-input').focus();}else if(key==='p'){event.preventDefault();printDialog();}else if(!edit&&key==='z'){event.preventDefault();history(event.shiftKey?'redo':'undo');}else if(!edit&&key==='y'){event.preventDefault();history('redo');}}if(!edit&&current()&&!$('#dialog').open){if(event.key==='PageDown'){event.preventDefault();goTo(current().page+1);}if(event.key==='PageUp'){event.preventDefault();goTo(current().page-1);}if(event.key==='Escape')hideSelection();}});
+async function askMobileSearch(){const answer=await ask('문서에서 찾기','<div class="field"><input data-field="query" type="search" aria-label="검색할 글자" placeholder="검색할 글자"></div>',[['cancel','취소'],['ok','찾기',true]]);if(answer.choice==='ok'){const tab=current();await task('문서 검색',async()=>{tab.search=await rpc('search',{id:tab.id,query:answer.values.query});if(tab.search.length){goTo(tab.search[0].page);toast(`${tab.search.length}페이지에서 찾았습니다. 첫 결과로 이동했습니다.`);}else toast('검색 결과가 없습니다.');});}}
+document.addEventListener('dragenter',event=>{if(event.dataTransfer.types.includes('Files')){event.preventDefault();state.dragDepth++;$('#drop-overlay').hidden=false;}});document.addEventListener('dragover',event=>{if(event.dataTransfer.types.includes('Files'))event.preventDefault();});document.addEventListener('dragleave',event=>{if(event.dataTransfer.types.includes('Files')){state.dragDepth--;if(state.dragDepth<=0)$('#drop-overlay').hidden=true;}});document.addEventListener('drop',event=>{if(event.dataTransfer.files.length){event.preventDefault();state.dragDepth=0;$('#drop-overlay').hidden=true;openFiles(event.dataTransfer.files);}});
+
+updateControls();$('#page-overlay').dataset.tool=state.tool;
+engineReady.then(()=>offerRecovery()).catch(errorMessage);
+// Expose a read-only summary for browser verification, without PDF bytes.
+globalThis.spdf={summary:()=>({version:'3.0.0',build:BUILD,tabs:state.tabs.map(({id,name,count,page,dirty})=>({id,name,count,page,dirty})),mode:state.mode,busy:state.busy})};

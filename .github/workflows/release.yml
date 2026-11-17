@@ -1,8 +1,6 @@
-name: Build and release S.PDF
+name: Windows installer (manual archive)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:

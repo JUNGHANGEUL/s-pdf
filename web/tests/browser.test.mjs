@@ -1,0 +1,84 @@
+// Run after building and serving web/dist. Set SPDF_URL to test a deployed build.
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {createRequire} from 'node:module';
+import {Engine} from '../engine.mjs';
+import mupdf from '../vendor/mupdf/mupdf.js';
+
+const require=createRequire(import.meta.url);
+const {chromium}=process.env.PLAYWRIGHT_MODULE_ROOT
+  ?require(path.join(process.env.PLAYWRIGHT_MODULE_ROOT,'playwright')):require('playwright');
+const target=process.env.SPDF_URL||'http://127.0.0.1:8765/';
+const output=process.env.SPDF_QA_OUTPUT||await fs.mkdtemp(path.join(os.tmpdir(),'spdf-web-qa-'));
+await fs.mkdir(output,{recursive:true});
+const engine=new Engine(),source=engine.demo();
+const sample=path.join(output,'sample.pdf');
+await fs.writeFile(sample,engine.save({id:source.id}).bytes);
+const raster=engine.render({id:source.id,scale:2}),scan=new mupdf.PDFDocument();
+const image=new mupdf.Image(raster.bytes),ref=scan.addImage(image);
+const scanPage=scan.addPage([0,0,600,800],0,{XObject:{Im:ref}},'q 600 0 0 800 0 0 cm /Im Do Q');
+scan.insertPage(-1,scanPage);const scanBuffer=scan.saveToBuffer('compress');
+const scanned=path.join(output,'scan.pdf');await fs.writeFile(scanned,scanBuffer.asUint8Array());
+scanPage.destroy();scanBuffer.destroy();ref.destroy();image.destroy();scan.destroy();
+
+const browser=await chromium.launch({headless:true,channel:process.env.SPDF_BROWSER||'msedge'});
+let checks=0;
+try{
+  const context=await browser.newContext({viewport:{width:1440,height:1000}});
+  const page=await context.newPage(),errors=[],requests=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  page.on('request',request=>requests.push({url:request.url(),method:request.method()}));
+  page.on('dialog',dialog=>dialog.accept());
+  const idle=()=>page.waitForFunction(()=>globalThis.spdf&&!spdf.summary().busy);
+  const rendered=()=>page.waitForFunction(()=>document.querySelector('#page-image').naturalWidth>0);
+  const click=async selector=>{await page.locator(selector).click();await idle();};
+  const open=async files=>{const count=await page.locator('.file-tab').count();await page.locator('#file-input').setInputFiles(files);await page.waitForFunction(n=>spdf.summary().tabs.length>n,count);await idle();await rendered();};
+  const download=async selector=>{const event=page.waitForEvent('download');await click(selector);const result=await event;const file=path.join(output,result.suggestedFilename());await result.saveAs(file);return file;};
+  const check=label=>{checks++;console.log('PASS '+label);};
+  await page.goto(target);await page.waitForFunction(()=>document.querySelector('#status').textContent.includes('준비 완료'));
+  await open(sample);await page.locator('#page-number').fill('2');await page.locator('#page-number').press('Enter');
+  await page.waitForFunction(()=>spdf.summary().tabs[0].page===1);
+  await open(sample);await page.locator('.file-tab').first().click();await idle();
+  assert.equal((await page.evaluate(()=>spdf.summary())).tabs[0].page,1);check('multiple PDF tabs preserve page position');
+  await click('#compare-button');await page.waitForFunction(()=>document.querySelector('#compare-image').naturalWidth>0);
+  await page.locator('.file-tab').nth(1).click();assert.equal(await page.locator('#compare-document option').count(),1);
+  await click('#close-compare');check('comparison works after switching tabs');
+  await page.locator('[data-mode=capture]').click();await page.locator('[data-capture-scope=page]').click();
+  const full=await download('#capture-save'),bytes=await fs.readFile(full);assert.equal(bytes.readUInt32BE(16),2500);assert.equal(bytes.readUInt32BE(20),3334);
+  await page.locator('[data-capture-scope=region]').click();
+  const box=await page.locator('#page-overlay').boundingBox();await page.mouse.move(box.x+box.width*.15,box.y+box.height*.15);await page.mouse.down();await page.mouse.move(box.x+box.width*.55,box.y+box.height*.35);await page.mouse.up();
+  const expected=await page.locator('#capture-resolution').innerText();const crop=await download('#capture-save'),cropped=await fs.readFile(crop);
+  assert.equal(`${cropped.readUInt32BE(16).toLocaleString()} × ${cropped.readUInt32BE(20).toLocaleString()} px`,expected);check('full and selected-region 300 dpi PNG downloads');
+  await page.locator('[data-mode=pages]').click();await click('#delete-pages');await click('#dialog-actions .primary');
+  assert.equal((await page.evaluate(()=>spdf.summary())).tabs[1].count,2);await click('#undo');
+  assert.equal((await page.evaluate(()=>spdf.summary())).tabs[1].count,3);
+  await page.getByRole('checkbox',{name:'1페이지 선택',exact:true}).check();
+  const extracted=await download('#extract-pages');const ex=engine.open({bytes:new Uint8Array(await fs.readFile(extracted)),name:'extracted.pdf'});assert.equal(ex.count,1);
+  const zip=await download('#split-pages');assert.equal((await fs.readFile(zip)).readUInt32LE(0),0x04034b50);check('page deletion, undo, extraction and split ZIP');
+  await page.locator('[data-mode=text]').click();await rendered();
+  await page.waitForTimeout(300);
+  const editBox=await page.locator('#page-overlay').boundingBox();await page.mouse.click(editBox.x+editBox.width*.3,editBox.y+editBox.height*.135);
+  await page.waitForFunction(()=>document.querySelector('#replacement-text').value.includes('문서 작업'));
+  await page.locator('#replacement-text').fill('웹에서 수정한 PDF');await click('#apply-text');
+  await click('#save-button');const saved=await download('#dialog-actions .primary');
+  const edited=engine.open({bytes:new Uint8Array(await fs.readFile(saved)),name:'edited.pdf'});
+  assert.match(engine.text({id:edited.id}).text,/웹에서 수정한 PDF/);assert.doesNotMatch(engine.text({id:edited.id}).text,/문서 작업을 한곳에서/);check('Korean text replacement survives downloaded PDF');
+  await page.locator('[data-mode=view]').click();await page.locator('[data-side=search]').click();await page.locator('#search-input').fill('수정한');await page.locator('#search-input').press('Enter');await idle();await page.locator('#search-list .side-item').waitFor();
+  await page.locator('[data-side=bookmarks]').click();await click('#add-bookmark');await page.locator('[data-field=title]').fill('내 북마크');await click('#dialog-actions .primary');await page.getByText('내 북마크',{exact:true}).waitFor();
+  await click('#merge-button');await click('#dialog-actions .primary');assert.equal((await page.evaluate(()=>spdf.summary())).tabs.at(-1).count,6);check('search, bookmarks and PDF merge');
+  await click('#settings-button');await page.locator('[data-field=theme]').selectOption('dark');await click('#dialog-actions .primary');assert.equal(await page.locator('html').getAttribute('data-theme'),'dark');
+  await page.screenshot({path:path.join(output,'desktop.png')});
+  for(const width of [1024,768,375,320]){await page.setViewportSize({width,height:900});await page.waitForTimeout(150);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.locator('[data-mode=capture]').click();await page.waitForTimeout(150);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.locator('[data-mode=view]').click();}
+  await page.waitForFunction(()=>document.querySelector('#view-container').clientWidth>250&&document.querySelector('#paper').clientWidth>150);
+  await page.screenshot({path:path.join(output,'mobile.png')});await page.setViewportSize({width:1440,height:1000});check('dark theme and responsive layout 320–1440px');
+  await open(scanned);await page.locator('[data-mode=text]').click();await click('#ocr-button');await click('#dialog-actions .primary');
+  await page.waitForFunction(()=>!spdf.summary().busy,{},{timeout:180000});
+  assert.match(await page.locator('#toast').innerText(),/1페이지 문자 인식 완료/);
+  await click('#save-button');const ocrFile=await download('#dialog-actions .primary');const recognized=engine.open({bytes:new Uint8Array(await fs.readFile(ocrFile)),name:'ocr.pdf'});
+  assert.match(engine.text({id:recognized.id}).text,/문서|PDF/);check('real local Korean and English OCR');
+  await page.waitForTimeout(4800);await page.reload();await page.getByText('이전 작업이 남아 있습니다',{exact:true}).waitFor();await click('#dialog-actions .primary');assert.ok((await page.evaluate(()=>spdf.summary())).tabs.length>=3);check('multiple documents recover after reloading');
+  assert.deepEqual(errors,[]);assert.ok(requests.every(r=>r.method==='GET'&&(r.url.startsWith(new URL(target).origin)||r.url.startsWith('blob:')||r.url.startsWith('data:'))));check('no PDF uploads or external network requests');
+  console.log(JSON.stringify({checks,output,requests:requests.length}));
+}finally{await browser.close();for(const id of [...engine.documents.keys()])engine.close({id});}

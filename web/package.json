@@ -1,0 +1,1 @@
+{"name":"spdf-web","private":true,"type":"module","version":"3.0.0","scripts":{"build":"python build.py","test":"node tests/engine.test.mjs"}}

@@ -11,3 +11,5 @@ tmp/
 output/
 installer/BuildInfo.cs
 assets/tessdata/*.traineddata
+web/vendor/
+web/dist/
