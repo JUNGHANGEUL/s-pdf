@@ -1,7 +1,7 @@
 // S.PDF Web — all PDF operations run locally in a worker. AGPL-3.0-or-later.
 import mupdf, {emptyStore} from './vendor/mupdf/mupdf.js';
 
-export const VERSION = '3.0.0';
+export const VERSION = '3.1.0';
 const MAX_PIXELS = 60_000_000;
 const drop = (...objects) => objects.forEach(object => object?.destroy?.());
 const intersect = (a,b) => a[0]<b[2] && a[2]>b[0] && a[1]<b[3] && a[3]>b[1];
@@ -141,12 +141,12 @@ export class Engine {
       else throw Error('지원하지 않는 페이지 작업입니다.');
     },'assemble');
   }
-  merge({ids,name='합친 문서.pdf',target=null}) {
+  merge({ids,name='합친 문서.pdf',target=null,at=null}) {
     if(!ids.length) throw Error('합칠 문서를 선택해주세요.');
     const sources=ids.map(id=>this.get(id).doc);
     for(const source of sources) if(!source.hasPermission('assemble')) throw Error('페이지 병합이 제한된 문서가 있습니다.');
     if(target && ids.includes(target)) throw Error('같은 문서를 자기 자신에 덧붙일 수 없습니다.');
-    const append=doc=>{for(const source of sources){const graft=doc.newGraftMap();try{for(let p=0;p<source.countPages();p++)graft.graftPage(-1,source,p);}finally{drop(graft);}}};
+    const append=doc=>{let position=at===null?doc.countPages():Math.max(0,Math.min(at,doc.countPages()));for(const source of sources){const graft=doc.newGraftMap();try{for(let p=0;p<source.countPages();p++)graft.graftPage(position++,source,p);}finally{drop(graft);}}};
     if(target) return this.operation(target,'PDF 덧붙이기',append,'assemble');
     const doc=new mupdf.PDFDocument();
     try {append(doc);return this.record(doc,name,true);} catch(error){drop(doc);throw error;}
@@ -195,9 +195,20 @@ export class Engine {
       } finally{drop(annotation,page);}
     },'annotate');
   }
+  updateAnnotations({id,page:index=0,changes=[],remove=[]}) {
+    return this.operation(id,'주석 편집',doc=>{const page=doc.loadPage(index),list=page.getAnnotations();try{
+      for(const change of changes){const a=list[change.index];if(!a)continue;
+        if(change.color)a.setColor(rgb(change.color));if(change.text!==undefined)a.setContents(change.text);
+        if(change.line)a.setLine(...change.line);
+        else if(change.rect){const old=a.getBounds(),r=change.rect,map=p=>[r[0]+(p[0]-old[0])*(r[2]-r[0])/(old[2]-old[0]||1),r[1]+(p[1]-old[1])*(r[3]-r[1])/(old[3]-old[1]||1)];
+          if(a.getType()==='Line')a.setLine(...a.getLine().map(map));else if(a.getType()==='Highlight')a.setQuadPoints(a.getQuadPoints().map(q=>{let n=[];for(let i=0;i<8;i+=2)n.push(...map([q[i],q[i+1]]));return n;}));else a.setRect(r);
+        }a.update();}
+      for(const index of [...remove].sort((a,b)=>b-a))if(list[index])page.deleteAnnotation(list[index]);
+    }finally{drop(...list,page);}},'annotate');
+  }
   annotations({id,page:index=0}) {
     const page=this.page(id,index);
-    try{return page.getAnnotations().map((a,i)=>({index:i,type:a.getType(),text:a.getContents(),rect:a.getBounds()}));}
+    try{return page.getAnnotations().map((a,i)=>({index:i,type:a.getType(),text:a.getContents(),rect:a.getBounds(),color:'#'+a.getColor().slice(0,3).map(v=>Math.round(v*255).toString(16).padStart(2,'0')).join(''),line:a.getType()==='Line'?a.getLine():null}));}
     finally{drop(page);}
   }
   deleteAnnotation({id,page:index=0,index:annotationIndex}) {
@@ -292,7 +303,7 @@ export class Engine {
     drop(ref);return this.record(doc,'S.PDF 사용 가이드.pdf',true);
   }
   dispatch(method,args={}) {
-    const allowed=['open','close','meta','render','text','copyText','search','editPages','merge','extract','editText','annotate','annotations','deleteAnnotation','bookmarks','bookmark','addOverlay','compress','save','history','demo'];
+    const allowed=['open','close','meta','render','text','copyText','search','editPages','merge','extract','editText','annotate','annotations','updateAnnotations','deleteAnnotation','bookmarks','bookmark','addOverlay','compress','save','history','demo'];
     if(!allowed.includes(method))throw Error('지원하지 않는 요청입니다.');
     return this[method](args);
   }
