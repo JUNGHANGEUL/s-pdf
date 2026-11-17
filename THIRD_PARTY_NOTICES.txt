@@ -1,0 +1,43 @@
+S.PDF 2.0 - third-party notices
+
+Application code: GNU Affero General Public License v3 or later.
+The complete application source, assets and build scripts are included in S.PDF_Source.zip.
+
+PyMuPDF 2.1 / MuPDF 1.28.6
+Copyright Artifex Software, Inc. and contributors.
+GNU AGPL v3 (or an independent commercial license from the vendor).
+Upstream source and build instructions:
+https://github.com/pymupdf/PyMuPDF
+https://github.com/ArtifexSoftware/mupdf
+The upstream wheel's COPYING notice is included in licenses.
+The optional neural-layout and ONNX features are not used or bundled by S.PDF.
+
+PySide6 Essentials / Shiboken6 / Qt 6.12.0
+Copyright The Qt Company Ltd. and contributors.
+LGPL-3.0 / GPL alternatives as described by the upstream project.
+Qt is dynamically linked; its libraries can be replaced with compatible builds.
+Source:
+https://code.qt.io/cgit/pyside/pyside-setup.git/
+https://code.qt.io/cgit/qt/qtbase.git/
+https://code.qt.io/cgit/qt/qtsvg.git/
+Upstream notices and the GNU LGPL v3 / GPL v3 license texts are included.
+
+Lucide icons
+ISC license; portions derived from Feather under MIT.
+https://github.com/lucide-icons/lucide
+Full notice: assets/Lucide-LICENSE.txt and licenses/Lucide-LICENSE.txt
+
+Tesseract tessdata_fast (Korean and English)
+Apache License 2.0.
+https://github.com/tesseract-ocr/tessdata_fast
+Language files: kor.traineddata, eng.traineddata.
+The models are used locally. No PDF or OCR data is uploaded.
+
+Python 3.12
+Python Software Foundation License.
+https://www.python.org/downloads/source/
+PyInstaller uses its bootloader license exception for the generated executable.
+https://pyinstaller.org/en/stable/license.html
+
+System fonts are loaded from the user's Windows installation; Windows font files
+are not redistributed in this installer.

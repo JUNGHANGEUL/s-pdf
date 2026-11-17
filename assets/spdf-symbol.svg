@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="S.PDF 심벌">
+  <rect width="96" height="96" rx="24" fill="#3567ED"/>
+  <path d="M67 19H42c-12 0-19 6-19 16 0 9 6 13 17 16l12 3c4 1 6 3 6 6 0 4-3 6-8 6H25v12h27c13 0 21-7 21-19 0-9-6-15-17-18l-13-3c-5-2-7-3-7-6s3-5 7-5h24V19Z" fill="#FFF"/>
+  <path d="M71 9v15h15L71 9Z" fill="#FFF" opacity=".38"/>
+</svg>

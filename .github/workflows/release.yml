@@ -1,0 +1,72 @@
+name: Build and release S.PDF
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spdf-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = python -c 'import version; print(version.VERSION)'
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+          gh release view "v$version" --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { 'exists=true' >> $env:GITHUB_OUTPUT } else { 'exists=false' >> $env:GITHUB_OUTPUT }
+          exit 0
+      - name: Install build dependencies
+        if: steps.version.outputs.exists != 'true'
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --disable-pip-version-check -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
+          .\.venv\Scripts\python.exe fetch_ocr_models.py
+          if ($LASTEXITCODE -ne 0) { throw 'OCR model preparation failed' }
+      - name: Verify document operations and updater
+        if: steps.version.outputs.exists != 'true'
+        env:
+          QT_QPA_PLATFORM: offscreen
+          SPDF_DISABLE_UPDATES: '1'
+        run: |
+          .\.venv\Scripts\python.exe -m pytest tests -q
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+      - name: Build installer
+        if: steps.version.outputs.exists != 'true'
+        run: |
+          .\test-installer.ps1
+          .\build.ps1
+      - name: Verify packaged application
+        if: steps.version.outputs.exists != 'true'
+        env:
+          SPDF_DISABLE_UPDATES: '1'
+        run: .\verify-release.ps1
+      - name: Publish verified release
+        if: steps.version.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $release = Join-Path (Split-Path -Parent $env:GITHUB_WORKSPACE) 'output\S.PDF'
+          $files = @('S.PDF-Setup.exe','S.PDF_Source.zip','update.json','SHA256.txt','사용방법.txt') | ForEach-Object { Join-Path $release $_ }
+          gh release create $env:TAG @files --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "S.PDF $env:TAG" --notes-file RELEASE_NOTES.md --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }

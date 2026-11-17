@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyd
+*.exe
+*.zip
+*.pdf
+*.pptx
+tmp/
+output/
+installer/BuildInfo.cs
+assets/tessdata/*.traineddata
