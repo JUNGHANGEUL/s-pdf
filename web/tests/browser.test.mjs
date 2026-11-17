@@ -46,10 +46,10 @@ try{
   await page.locator('.file-tab').nth(1).click();assert.equal(await page.locator('#compare-document option').count(),1);
   await click('#close-compare');check('comparison works after switching tabs');
   await page.locator('[data-mode=capture]').click();await page.locator('[data-capture-scope=page]').click();
-  const full=await download('#capture-save'),bytes=await fs.readFile(full);assert.equal(bytes.readUInt32BE(16),2500);assert.equal(bytes.readUInt32BE(20),3334);
+  await page.locator('#capture-dpi').evaluate(el=>{el.value='300';el.dispatchEvent(new Event('input',{bubbles:true}));});const full=await download('#capture-save'),bytes=await fs.readFile(full);assert.equal(bytes.readUInt32BE(16),2500);assert.equal(bytes.readUInt32BE(20),3334);
   await page.locator('[data-capture-scope=region]').click();
   const box=await page.locator('#page-overlay').boundingBox();await page.mouse.click(box.x+box.width*.15,box.y+box.height*.15);await page.mouse.move(box.x+box.width*.55,box.y+box.height*.35);await page.mouse.click(box.x+box.width*.55,box.y+box.height*.35);
-  const expected=await page.locator('#capture-resolution').innerText();const crop=await download('#capture-save'),cropped=await fs.readFile(crop);
+  await page.locator('#capture-dpi').evaluate(el=>{el.value='300';el.dispatchEvent(new Event('input',{bubbles:true}));});const expected=await page.locator('#capture-resolution').innerText();const crop=await download('#capture-save'),cropped=await fs.readFile(crop);
   assert.equal(`${cropped.readUInt32BE(16).toLocaleString()} × ${cropped.readUInt32BE(20).toLocaleString()} px`,expected);check('full and selected-region 300 dpi PNG downloads');
   await page.locator('[data-mode=pages]').click();await click('#delete-pages');await click('#dialog-actions .primary');
   assert.equal((await page.evaluate(()=>spdf.summary())).tabs[1].count,2);await click('#undo');

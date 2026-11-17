@@ -1,7 +1,7 @@
 export const CAPTURE_LIMITS={normal:60_000_000,png:240_000_000,side:32000};
-export function capturePlan(area,{dpi=300,zoom=0,kind='png'}={}){
+export function capturePlan(area,{dpi=300,kind='png'}={}){
   if(area.length!==4||area.some(v=>!Number.isFinite(v))||area[2]<=area[0]||area[3]<=area[1])throw Error('캡처 영역을 확인해주세요.');
-  const requested=dpi==='max'?Infinity:Math.max(Number(dpi)/72,kind==='copy'?zoom:0);
+  const requested=dpi==='max'?Infinity:Number(dpi)/72;
   if(!(requested>0))throw Error('해상도를 확인해주세요.');
   const limit=kind==='png'?CAPTURE_LIMITS.png:CAPTURE_LIMITS.normal;
   const dimensions=scale=>[Math.ceil(area[2]*scale)-Math.floor(area[0]*scale),Math.ceil(area[3]*scale)-Math.floor(area[1]*scale)];

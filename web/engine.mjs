@@ -3,7 +3,7 @@ import mupdf, {emptyStore} from './vendor/mupdf/mupdf.js';
 import {bandedPNG} from './png.mjs';
 import {CAPTURE_LIMITS} from './capture.mjs';
 
-export const VERSION = '3.3.0';
+export const VERSION = '3.4.0';
 const MAX_PIXELS = 60_000_000;
 const drop = (...objects) => objects.forEach(object => object?.destroy?.());
 const intersect = (a,b) => a[0]<b[2] && a[2]>b[0] && a[1]<b[3] && a[3]>b[1];
@@ -187,12 +187,12 @@ export class Engine {
       } finally {drop(page);}
     });
   }
-  annotate({id,page:index=0,type='Highlight',rect,color='#f0b92f',text=''}) {
+  annotate({id,page:index=0,type='Highlight',rect,color='#f0b92f',text='',arrow=true,line=null}) {
     return this.operation(id,'주석 추가',doc=>{
       const page=doc.loadPage(index), annotation=page.createAnnotation(type);
       try {
         annotation.setColor(rgb(color));annotation.setAuthor('S.PDF');
-        if(type==='Line'){annotation.setLine([rect[0],rect[1]],[rect[2],rect[3]]);annotation.setLineEndingStyles('None','ClosedArrow');annotation.setBorderWidth(2);}
+        if(type==='Line'){annotation.setLine(...(line||[[rect[0],rect[1]],[rect[2],rect[3]]]));annotation.setLineEndingStyles('None',arrow?'ClosedArrow':'None');annotation.setBorderWidth(2);}
         else if(type==='Highlight'){annotation.setQuadPoints([[rect[0],rect[1],rect[2],rect[1],rect[0],rect[3],rect[2],rect[3]]]);annotation.setOpacity(.4);}
         else {annotation.setRect(rect);if(type==='Square')annotation.setBorderWidth(1.5);}
         if(text)annotation.setContents(text);
@@ -213,7 +213,7 @@ export class Engine {
   }
   annotations({id,page:index=0}) {
     const page=this.page(id,index);
-    try{return page.getAnnotations().map((a,i)=>({index:i,type:a.getType(),text:a.getContents(),rect:a.getBounds(),width:a.getBorderWidth(),color:'#'+a.getColor().slice(0,3).map(v=>Math.round(v*255).toString(16).padStart(2,'0')).join(''),line:a.getType()==='Line'?a.getLine():null}));}
+    try{return page.getAnnotations().map((a,i)=>({index:i,type:a.getType(),text:a.getContents(),rect:a.getBounds(),width:a.getBorderWidth(),color:'#'+a.getColor().slice(0,3).map(v=>Math.round(v*255).toString(16).padStart(2,'0')).join(''),line:a.getType()==='Line'?a.getLine():null,endings:a.getType()==='Line'?a.getLineEndingStyles():null}));}
     finally{drop(page);}
   }
   deleteAnnotation({id,page:index=0,index:annotationIndex}) {
