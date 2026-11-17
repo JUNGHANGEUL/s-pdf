@@ -1,7 +1,9 @@
 // S.PDF Web — all PDF operations run locally in a worker. AGPL-3.0-or-later.
 import mupdf, {emptyStore} from './vendor/mupdf/mupdf.js';
+import {bandedPNG} from './png.mjs';
+import {CAPTURE_LIMITS} from './capture.mjs';
 
-export const VERSION = '3.2.0';
+export const VERSION = '3.3.0';
 const MAX_PIXELS = 60_000_000;
 const drop = (...objects) => objects.forEach(object => object?.destroy?.());
 const intersect = (a,b) => a[0]<b[2] && a[2]>b[0] && a[1]<b[3] && a[3]>b[1];
@@ -87,10 +89,12 @@ export class Engine {
     if(!Number.isInteger(index)||index<0||index>=doc.countPages()) throw Error('페이지를 찾을 수 없습니다.');
     return doc.loadPage(index);
   }
-  render({id,page:pageIndex=0,scale=1,clip=null,format='png',quality=92,excludeAnnotations=[]}) {
+  render({id,page:pageIndex=0,scale=1,clip=null,format='png',quality=92,excludeAnnotations=[],largePNG=false}) {
     const page=this.page(id,pageIndex), bounds=page.getBounds();
     const area=clip||bounds;
-    if(!Number.isFinite(scale)||scale<=0||Math.ceil((area[2]-area[0])*scale)*Math.ceil((area[3]-area[1])*scale)>MAX_PIXELS) { drop(page); throw Error('이미지가 너무 큽니다. 해상도·확대 배율을 낮추거나 영역을 줄여주세요.'); }
+    const box=[Math.floor(area[0]*scale),Math.floor(area[1]*scale),Math.ceil(area[2]*scale),Math.ceil(area[3]*scale)],width=box[2]-box[0],height=box[3]-box[1];
+    if(!Number.isFinite(scale)||scale<=0||width<=0||height<=0||width>CAPTURE_LIMITS.side||height>CAPTURE_LIMITS.side||width*height>(largePNG&&format==='png'?CAPTURE_LIMITS.png:MAX_PIXELS)) { drop(page); throw Error('이미지가 너무 큽니다. 해상도·확대 배율을 낮추거나 영역을 줄여주세요.'); }
+    if(largePNG&&format==='png'&&width*height>MAX_PIXELS){try{const bytes=bandedPNG(width,height,scale*72,(top,count)=>{let pix,device;try{pix=new mupdf.Pixmap(mupdf.ColorSpace.DeviceRGB,[box[0],box[1]+top,box[2],box[1]+top+count],false);pix.clear(255);device=new mupdf.DrawDevice(mupdf.Matrix.scale(scale,scale),pix);page.run(device,mupdf.Matrix.identity);device.close();const pixels=pix.getPixels(),stride=pix.getStride(),out=new Uint8Array(width*3*count);for(let row=0;row<count;row++)out.set(pixels.subarray(row*stride,row*stride+width*3),row*width*3);this.progress({label:'초고화질 PNG 만들기',current:top+count,total:height});return out;}finally{drop(device,pix);}});return{bytes,width,height,bounds,format};}finally{drop(page);}}
     let pixmap,device,temporary=false,annotations=[];
     try {
       if(excludeAnnotations.length){this.get(id).doc.beginOperation('주석 드래그 미리보기');temporary=true;annotations=page.getAnnotations();for(const i of excludeAnnotations)if(annotations[i]){annotations[i].setFlags(annotations[i].getFlags()|2);annotations[i].update();}}
