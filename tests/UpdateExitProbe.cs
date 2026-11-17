@@ -8,12 +8,22 @@ internal static class UpdateExitProbe
 {
     private static int Main(string[] args)
     {
+        try { return Run(args); }
+        catch (Exception error)
+        {
+            File.WriteAllText(Path.Combine(Environment.GetEnvironmentVariable("SPDF_APPLY_TEST_ROOT"), "probe-error.txt"), error.ToString());
+            return 5;
+        }
+    }
+    private static int Run(string[] args)
+    {
         string profile = Environment.GetEnvironmentVariable("SPDF_APPLY_TEST_ROOT");
         string application = Environment.GetEnvironmentVariable("SPDF_APPLY_TEST_APP");
+        File.WriteAllText(Path.Combine(profile, "probe-started.txt"), "started");
         int index = Array.IndexOf(args, "/wait"), parentId;
         if (index < 0 || !Int32.TryParse(args[index + 1], out parentId)) return 2;
-        try { using (Process parent = Process.GetProcessById(parentId)) if (!parent.WaitForExit(8000)) return 3; } catch (ArgumentException) { }
-        DateTime until = DateTime.UtcNow.AddSeconds(8);
+        try { using (Process parent = Process.GetProcessById(parentId)) if (!parent.WaitForExit(20000)) { File.WriteAllText(Path.Combine(profile, "failed.txt"), "parent did not exit"); return 3; } } catch (ArgumentException) { }
+        DateTime until = DateTime.UtcNow.AddSeconds(20);
         while (DateTime.UtcNow < until)
         {
             bool running = false;

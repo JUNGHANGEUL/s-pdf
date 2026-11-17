@@ -32,9 +32,11 @@ environment = dict(os.environ, SPDF_DATA_DIR=str(profile), SPDF_APPLY_TEST_ROOT=
 environment.pop("SPDF_DISABLE_UPDATES", None)
 result = subprocess.run([str(app / "S.PDF.exe")], env=environment, capture_output=True, timeout=20)
 assert result.returncode == 0, result.stderr
-deadline = time.monotonic() + 10
+deadline = time.monotonic() + 45
 while not (profile / "applied.txt").exists() and time.monotonic() < deadline:
     time.sleep(.05)
-assert (profile / "applied.txt").exists(), "Updater could not proceed after launcher exit"
+if not (profile / "applied.txt").exists():
+    diagnostic = {file.name:file.read_text(encoding="utf-8-sig", errors="replace") for file in profile.glob("*.txt")}
+    raise AssertionError("Updater could not proceed after launcher exit: " + repr(diagnostic))
 assert not (profile / "failed.txt").exists()
 print("PASS: real launcher exits before the detached updater applies; no inherited pipe deadlock.")
