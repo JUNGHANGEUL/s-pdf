@@ -1,10 +1,17 @@
 using System;
 using System.Drawing;
 using System.IO;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
 using System.Windows.Forms;
 
 internal static class InstallerTests
 {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(string path, uint access, uint sharing, IntPtr security, uint creation, uint flags, IntPtr template);
     private static void Check(bool value, string text) { if (!value) throw new Exception(text); }
     [STAThread]
     private static int Main(string[] args)
@@ -14,6 +21,18 @@ internal static class InstallerTests
             Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
             string root = Path.GetFullPath(args[0]), target = Path.Combine(root, "application"), profile = Path.Combine(root, "profile");
             Environment.SetEnvironmentVariable("SPDF_DATA_DIR", profile);
+            string locked = Path.Combine(root, "locked-folder"), moved = locked + "-moved";
+            Directory.CreateDirectory(locked);
+            using (SafeFileHandle handle = CreateFile(locked, 0x80, 3, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero))
+            {
+                Check(!handle.IsInvalid, "Could not create a directory lock fixture");
+                Stopwatch watch = Stopwatch.StartNew();
+                Task release = Task.Run(() => { Thread.Sleep(650); handle.Dispose(); });
+                SetupProgram.MoveDirectoryWithRetry(locked, moved, null);
+                release.Wait();
+                Check(Directory.Exists(moved) && watch.ElapsedMilliseconds >= 500, "Folder move did not wait for the lock");
+            }
+            Directory.Delete(moved);
             SetupProgram.Install(false, null, null, null, target, false);
             Check(File.Exists(Path.Combine(target, ".spdf-install")), "Initial installation marker missing");
             File.WriteAllText(Path.Combine(target, "app.dat"), "previous version");
@@ -36,7 +55,7 @@ internal static class InstallerTests
             SetupProgram.SaveUpdatePreference(true);
             using (SetupForm form = new SetupForm(true)) using (Bitmap image = new Bitmap(form.Width, form.Height))
             { form.Opacity = 0; form.ShowInTaskbar = false; form.Show(); Application.DoEvents(); form.DrawToBitmap(image, new Rectangle(Point.Empty, form.Size)); image.Save(Path.Combine(root, "installer.png")); }
-            Console.WriteLine("PASS: install, cancellation, deployment rollback, replacement, user files, preferences, installer render."); return 0;
+            Console.WriteLine("PASS: transient folder lock, install, cancellation, deployment rollback, replacement, user files, preferences, installer render."); return 0;
         }
         catch (Exception error) { Console.Error.WriteLine(error); return 1; }
     }

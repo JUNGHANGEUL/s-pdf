@@ -86,6 +86,39 @@ internal static class SetupProgram
         return false;
     }
 
+    internal static void Log(string phase, Exception error = null)
+    {
+        try
+        {
+            Directory.CreateDirectory(Profile);
+            File.AppendAllText(Path.Combine(Profile, "installer.log"), DateTime.Now.ToString("s") + " " + phase + (error == null ? "" : "\r\n" + error.ToString()) + "\r\n", new UTF8Encoding(false));
+        }
+        catch (IOException) { } catch (UnauthorizedAccessException) { }
+    }
+
+    private static void RetryDirectoryOperation(Action operation, Func<bool> cancelled)
+    {
+        Stopwatch watch = Stopwatch.StartNew();
+        bool reported = false;
+        while (true)
+        {
+            if (cancelled != null && cancelled()) throw new OperationCanceledException();
+            try { operation(); return; }
+            catch (Exception error)
+            {
+                int code = error.HResult & 0xffff;
+                if (!(error is IOException || error is UnauthorizedAccessException) || (code != 5 && code != 32 && code != 33) || watch.ElapsedMilliseconds >= 15000) throw;
+                if (!reported) { Log("Waiting for a transient installation folder lock", error); reported = true; }
+                Thread.Sleep(250);
+            }
+        }
+    }
+
+    internal static void MoveDirectoryWithRetry(string source, string destination, Func<bool> cancelled)
+    {
+        RetryDirectoryOperation(() => Directory.Move(source, destination), cancelled);
+    }
+
     internal static void Extract(string destination, Action<int, string> progress, Func<bool> cancelled)
     {
         if (Directory.Exists(destination) && Directory.GetFileSystemEntries(destination).Length > 0) throw new IOException("압축을 풀 폴더가 비어 있지 않습니다.");
@@ -141,6 +174,7 @@ internal static class SetupProgram
 
     internal static void Install(bool desktop, bool? updates, Action<int, string> progress, Func<bool> cancelled, string targetFolder, bool register)
     {
+        Log("Starting S.PDF " + BuildInfo.Version + " installation to " + targetFolder);
         if (AppRunning(targetFolder)) throw new IOException("S.PDF를 닫은 뒤 다시 설치해주세요.");
         if (Directory.Exists(targetFolder) && !File.Exists(Path.Combine(targetFolder, Marker))) throw new IOException("설치 위치에 다른 폴더가 있습니다.\n" + targetFolder);
         string parent = Path.GetDirectoryName(Path.GetFullPath(targetFolder)); Directory.CreateDirectory(parent);
@@ -152,8 +186,9 @@ internal static class SetupProgram
             Extract(staging, progress, cancelled);
             File.WriteAllText(Path.Combine(staging, Marker), "S.PDF " + BuildInfo.Version);
             if (cancelled != null && cancelled()) throw new OperationCanceledException();
-            if (Directory.Exists(targetFolder)) { Directory.Move(targetFolder, backup); backedUp = true; }
-            Directory.Move(staging, targetFolder); deployed = true;
+            if (progress != null) progress(86, "설치 파일을 마무리하는 중");
+            if (Directory.Exists(targetFolder)) { MoveDirectoryWithRetry(targetFolder, backup, cancelled); backedUp = true; }
+            MoveDirectoryWithRetry(staging, targetFolder, cancelled); deployed = true;
             if (progress != null) progress(90, "바로가기와 설정을 저장하는 중");
             if (register)
             {
@@ -171,16 +206,21 @@ internal static class SetupProgram
                 if (updates.HasValue) SaveUpdatePreference(updates.Value);
             }
         }
-        catch
+        catch (Exception error)
         {
+            Log("Installation failed; restoring the previous installation", error);
             if (deployed && File.Exists(Path.Combine(targetFolder, Marker))) InstallFiles.RemoveOwned(targetFolder);
-            if (backedUp && Directory.Exists(backup) && !Directory.Exists(targetFolder)) Directory.Move(backup, targetFolder);
+            if (backedUp && Directory.Exists(backup) && !Directory.Exists(targetFolder)) MoveDirectoryWithRetry(backup, targetFolder, null);
             throw;
         }
         finally
         {
             string resolved = Path.GetFullPath(staging);
-            if (Directory.Exists(staging) && String.Equals(Path.GetDirectoryName(resolved), parent, StringComparison.OrdinalIgnoreCase) && Path.GetFileName(resolved).StartsWith("S.PDF-staging-", StringComparison.Ordinal)) Directory.Delete(staging, true);
+            if (Directory.Exists(staging) && String.Equals(Path.GetDirectoryName(resolved), parent, StringComparison.OrdinalIgnoreCase) && Path.GetFileName(resolved).StartsWith("S.PDF-staging-", StringComparison.Ordinal))
+            {
+                try { RetryDirectoryOperation(() => Directory.Delete(staging, true), null); }
+                catch (Exception cleanupError) { Log("Could not clean the temporary folder: " + staging, cleanupError); }
+            }
         }
         if (backedUp && Directory.Exists(backup))
         {
@@ -195,6 +235,7 @@ internal static class SetupProgram
             try { InstallFiles.RemoveOwned(backup); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
         if (progress != null) progress(100, "설치가 완료되었습니다.");
+        Log("Installation completed");
     }
 }
 
@@ -271,7 +312,7 @@ internal sealed class SetupForm : Form
             launch.Visible = true; secondary.Visible = false; primary.Text = "시작하기  →"; note.Text = "S.PDF " + BuildInfo.Version + " · 설치 완료";
         }
         catch (OperationCanceledException) { CloseAfterWork(); }
-        catch (Exception error) { MessageBox.Show(this, error.Message, "S.PDF 설치", MessageBoxButtons.OK, MessageBoxIcon.Information); CloseAfterWork(); }
+        catch (Exception error) { SetupProgram.Log("Installer window reported an error", error); MessageBox.Show(this, error.Message + "\n\n설치 기록: " + Path.Combine(SetupProgram.Profile, "installer.log"), "S.PDF 설치", MessageBoxButtons.OK, MessageBoxIcon.Information); CloseAfterWork(); }
         finally { busy = false; if (!IsDisposed) primary.Enabled = true; }
     }
     private void CloseAfterWork() { busy = false; Close(); }
