@@ -1,7 +1,7 @@
 // S.PDF Web — all PDF operations run locally in a worker. AGPL-3.0-or-later.
 import mupdf, {emptyStore} from './vendor/mupdf/mupdf.js';
 
-export const VERSION = '3.1.0';
+export const VERSION = '3.2.0';
 const MAX_PIXELS = 60_000_000;
 const drop = (...objects) => objects.forEach(object => object?.destroy?.());
 const intersect = (a,b) => a[0]<b[2] && a[2]>b[0] && a[1]<b[3] && a[3]>b[1];
@@ -87,12 +87,13 @@ export class Engine {
     if(!Number.isInteger(index)||index<0||index>=doc.countPages()) throw Error('페이지를 찾을 수 없습니다.');
     return doc.loadPage(index);
   }
-  render({id,page:pageIndex=0,scale=1,clip=null,format='png',quality=92}) {
+  render({id,page:pageIndex=0,scale=1,clip=null,format='png',quality=92,excludeAnnotations=[]}) {
     const page=this.page(id,pageIndex), bounds=page.getBounds();
     const area=clip||bounds;
-    if(!Number.isFinite(scale)||scale<=0||Math.ceil((area[2]-area[0])*scale)*Math.ceil((area[3]-area[1])*scale)>MAX_PIXELS) { drop(page); throw Error('이미지가 너무 큽니다. 해상도를 낮추거나 영역을 줄여주세요.'); }
-    let pixmap,device;
+    if(!Number.isFinite(scale)||scale<=0||Math.ceil((area[2]-area[0])*scale)*Math.ceil((area[3]-area[1])*scale)>MAX_PIXELS) { drop(page); throw Error('이미지가 너무 큽니다. 해상도·확대 배율을 낮추거나 영역을 줄여주세요.'); }
+    let pixmap,device,temporary=false,annotations=[];
     try {
+      if(excludeAnnotations.length){this.get(id).doc.beginOperation('주석 드래그 미리보기');temporary=true;annotations=page.getAnnotations();for(const i of excludeAnnotations)if(annotations[i]){annotations[i].setFlags(annotations[i].getFlags()|2);annotations[i].update();}}
       if(clip) {
         const box=[Math.floor(area[0]*scale),Math.floor(area[1]*scale),Math.ceil(area[2]*scale),Math.ceil(area[3]*scale)];
         pixmap=new mupdf.Pixmap(mupdf.ColorSpace.DeviceRGB,box,false); pixmap.clear(255);
@@ -101,7 +102,7 @@ export class Engine {
       } else pixmap=page.toPixmap(mupdf.Matrix.scale(scale,scale),mupdf.ColorSpace.DeviceRGB,false,true);
       pixmap.setResolution(Math.round(scale*72),Math.round(scale*72));
       return {bytes:(format==='jpg'?pixmap.asJPEG(quality,false):pixmap.asPNG()).slice(),width:pixmap.getWidth(),height:pixmap.getHeight(),bounds,format};
-    } finally { drop(device,pixmap,page); }
+    } finally {drop(...annotations,device,pixmap,page);if(temporary)this.get(id).doc.abandonOperation();}
   }
   text({id,page:index=0}) {
     const page=this.page(id,index), text=page.toStructuredText('preserve-whitespace');
@@ -208,7 +209,7 @@ export class Engine {
   }
   annotations({id,page:index=0}) {
     const page=this.page(id,index);
-    try{return page.getAnnotations().map((a,i)=>({index:i,type:a.getType(),text:a.getContents(),rect:a.getBounds(),color:'#'+a.getColor().slice(0,3).map(v=>Math.round(v*255).toString(16).padStart(2,'0')).join(''),line:a.getType()==='Line'?a.getLine():null}));}
+    try{return page.getAnnotations().map((a,i)=>({index:i,type:a.getType(),text:a.getContents(),rect:a.getBounds(),width:a.getBorderWidth(),color:'#'+a.getColor().slice(0,3).map(v=>Math.round(v*255).toString(16).padStart(2,'0')).join(''),line:a.getType()==='Line'?a.getLine():null}));}
     finally{drop(page);}
   }
   deleteAnnotation({id,page:index=0,index:annotationIndex}) {
