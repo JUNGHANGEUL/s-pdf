@@ -2,8 +2,9 @@
 import mupdf, {emptyStore} from './vendor/mupdf/mupdf.js';
 import {bandedPNG} from './png.mjs';
 import {CAPTURE_LIMITS} from './capture.mjs';
+import {glyphPlan} from './typography.mjs';
 
-export const VERSION = '3.4.1';
+export const VERSION = '3.5.0';
 const MAX_PIXELS = 60_000_000;
 const drop = (...objects) => objects.forEach(object => object?.destroy?.());
 const intersect = (a,b) => a[0]<b[2] && a[2]>b[0] && a[1]<b[3] && a[3]>b[1];
@@ -52,7 +53,7 @@ export class Engine {
   record(doc,name,baseDirty=false,password='') {
     doc.disableJS(); doc.enableJournal();
     const id='pdf-'+(++this.sequence);
-    this.documents.set(id,{doc,name,saved:0,baseDirty,password,revision:0});
+    this.documents.set(id,{doc,name,saved:0,baseDirty,password,revision:0,sourceFonts:new Map(),fontPointers:new Map()});
     return this.meta(id);
   }
   get(id) { const item=this.documents.get(id); if(!item) throw Error('문서를 다시 열어주세요.'); return item; }
@@ -70,7 +71,7 @@ export class Engine {
       return this.record(doc,name,recovered,password);
     } catch(error) { drop(doc); throw error; }
   }
-  close({id}) { const item=this.get(id); item.doc.destroy(); this.documents.delete(id); emptyStore(); return true; }
+  close({id}) { const item=this.get(id);for(const record of item.sourceFonts.values())drop(record.face);item.sourceFonts.clear();item.doc.destroy(); this.documents.delete(id); emptyStore(); return true; }
   operation(id,label,action,permission='edit') {
     const item=this.get(id);
     if(!item.doc.hasPermission(permission)) throw Error('문서에 설정된 편집 권한을 확인해주세요.');
@@ -110,11 +111,11 @@ export class Engine {
   }
   text({id,page:index=0}) {
     const page=this.page(id,index), text=page.toStructuredText('preserve-whitespace');
-    const lines=[]; let line;
+    const lines=[],item=this.get(id); let line;const colorHex=color=>{const values=color.length===1?[color[0],color[0],color[0]]:color.length===4?[0,1,2].map(i=>1-Math.min(1,color[i]+color[3])):color;return '#'+values.map(v=>Math.round(v*255).toString(16).padStart(2,'0')).join('');};
     try {
       text.walk({beginLine:(bbox,wmode,dir)=>{line={rect:bbox,dir,wmode,text:'',chars:[],size:12,origin:[bbox[0],bbox[3]]};},
-        onChar:(c,origin,font,size,quad)=>{if(!line)return;if(!line.text){line.origin=origin;line.size=size;}line.text+=c;line.chars.push({c,quad});},
-        endLine:()=>{if(line?.text.trim()) lines.push(line);line=null;}});
+        onChar:(c,origin,font,size,quad,color)=>{try{if(!line)return;let key=item.fontPointers.get(font.pointer);if(!key){key='source-'+(++this.sequence);const face=new mupdf.Font(font.pointer);item.sourceFonts.set(key,{key,face,name:face.getName(),bold:face.isBold(),italic:face.isItalic(),serif:face.isSerif(),mono:face.isMono(),pages:new Set()});item.fontPointers.set(font.pointer,key);}item.sourceFonts.get(key).pages.add(index);if(!line.text){line.origin=origin;line.size=size;line.color=colorHex(color);}line.text+=c;line.chars.push({c,quad,fontKey:key});line.fontCounts||={};line.fontCounts[key]=(line.fontCounts[key]||0)+1;}finally{drop(font);}},
+        endLine:()=>{if(line?.text.trim()){line.fontKey=Object.keys(line.fontCounts).sort((a,b)=>line.fontCounts[b]-line.fontCounts[a])[0];line.fontName=item.sourceFonts.get(line.fontKey).name;delete line.fontCounts;lines.push(line);}line=null;}});
       return {lines,text:text.asText(),bounds:page.getBounds()};
     } finally { drop(text,page); }
   }
@@ -162,30 +163,40 @@ export class Engine {
     try {for(const p of pages){if(p<0||p>=source.countPages())throw Error('추출 페이지를 확인해주세요.');graft.graftPage(-1,source,p);}const bytes=output.saveToBuffer('compress=yes,garbage=4');try{return bytes.asUint8Array().slice();}finally{drop(bytes);}}
     finally{drop(graft,output);}
   }
-  insertText(doc,page,{text,origin,size=12,color='#202c42',font='ko',invisible=false,width=null,fit=true}) {
-    const face=this.font(font), glyphs=[...text].map(c=>face.encodeCharacter(c));
-    if(glyphs.some((gid,i)=>gid===0&&!/\s/.test([...text][i]))) throw Error('선택한 글꼴에 없는 글자가 있습니다. 기본 고딕 글꼴을 사용해주세요.');
-    const advance=glyphs.reduce((sum,gid)=>sum+face.advanceGlyph(gid),0);
-    if(width&&advance*size>width){if(!fit)throw Error('글자가 선택 영역보다 깁니다. 크기를 줄여주세요.');size=width/advance;if(size<4)throw Error('내용이 너무 깁니다. 영역을 넓히거나 글자 수를 줄여주세요.');}
-    const ref=doc.addFont(face), name='SPDF_Font_'+(++this.sequence);
-    pageResource(doc,page,'Font',name,ref);drop(ref);
-    const hex=glyphs.map(gid=>gid.toString(16).padStart(4,'0')).join('');
-    const matrix=mupdf.Matrix.invert(page.getTransform()).map(numeric).join(' ');
-    const [x,y]=origin;
-    appendContent(doc,page,`q ${matrix} cm BT /${name} ${numeric(size)} Tf ${invisible?'3':'0'} Tr ${rgb(color).map(numeric).join(' ')} rg 1 0 0 -1 ${numeric(x)} ${numeric(y)} Tm <${hex}> Tj ET Q\n`);
+  textPlan(id,text,font='auto',sourceFontKey=null){
+    const item=this.get(id),original=item.sourceFonts.get(sourceFontKey),auto=font==='auto',candidates=[];
+    if(auto&&original&&[...text].some(c=>!original.face.encodeCharacter(c))){
+      item.glyphPages||=new Map();
+      for(const index of original.pages||[]){if(item.glyphPages.get(index)===item.revision)continue;const page=this.page(id,index);let device;
+        const collect=(text,...objects)=>{try{text.walk({showGlyph:(font,trm,gid,unicode)=>{const record=item.sourceFonts.get(item.fontPointers.get(font.pointer));if(record&&gid>0&&unicode>0){record.glyphs||=new Map();record.glyphs.set(String.fromCodePoint(unicode),gid);}}});}finally{drop(text,...objects.filter(o=>o?.destroy));}};
+        try{device=new mupdf.Device({fillText:collect,strokeText:collect,ignoreText:collect,clipText:collect,clipStrokeText:collect});page.runPageContents(device,mupdf.Matrix.identity);device.close();item.glyphPages.set(index,item.revision);}finally{drop(device,page);}
+      }
+    }
+    if(auto&&original){if(original.embeddable===undefined){const probe=new mupdf.PDFDocument();let ref;try{ref=probe.addFont(original.face);original.embeddable=true;}catch{original.embeddable=false;}finally{drop(ref,probe);}}if(original.embeddable)candidates.push({...original,original:true});}
+    const suffix=original?.bold?(original?.italic?'BoldItalic':'Bold'):(original?.italic?'Italic':'');
+    const latin=original?.mono?('Courier'+(suffix?'-'+(suffix==='Italic'?'Oblique':suffix==='BoldItalic'?'BoldOblique':suffix):'')):original?.serif?(suffix?'Times-'+suffix:'Times-Roman'):('Helvetica'+(suffix?'-'+(suffix==='Italic'?'Oblique':suffix==='BoldItalic'?'BoldOblique':suffix):''));
+    const names=auto?(original?[latin,'ko','Helvetica','Symbol','ZapfDingbats']:['ko','Helvetica','Symbol','ZapfDingbats']):[font,'ko','Helvetica','Symbol','ZapfDingbats'];
+    for(const name of [...new Set(names)]){const face=this.font(name);candidates.push({key:'builtin-'+name,face,name:face.getName(),bold:auto&&!!original?.bold&&!face.isBold(),italic:auto&&!!original?.italic&&!face.isItalic()});}
+    const plan=glyphPlan(text,candidates);plan.source=auto?original?.name:null;plan.sourceMatched=auto&&!!original&&plan.runs.some(r=>r.original);plan.substituted=auto&&!!original&&plan.runs.some(r=>!r.original);return plan;
   }
-  editText({id,page:index=0,rect,text,size=12,color='#202c42',font='ko',replace=false,origin=null,fit=true,clearImage=false}) {
-    if(!text.trim()) throw Error('새로 넣을 글자를 입력해주세요.');
-    // Validate layout before any redaction changes the original content.
-    const face=this.font(font), advance=[...text].reduce((sum,c)=>sum+face.advanceGlyph(face.encodeCharacter(c)),0);
-    if(advance*size>rect[2]-rect[0] && (!fit||(rect[2]-rect[0])/advance<4))throw Error('내용이 너무 깁니다. 영역을 넓히거나 글자 크기를 줄여주세요.');
-    return this.operation(id,replace?'기존 글자 수정':'글자 추가',doc=>{
-      const page=doc.loadPage(index);
-      try {
-        if(replace){const redact=page.createAnnotation('Redact');redact.setRect(rect);redact.update();drop(redact);page.applyRedactions(false,clearImage?2:0,0,0);}
-        this.insertText(doc,page,{text,origin:origin||[rect[0],rect[1]+size],size,color,font,width:rect[2]-rect[0],fit});
-      } finally {drop(page);}
-    });
+  insertText(doc,page,{text,origin,size=12,color='#202c42',font='auto',invisible=false,width=null,fit=true,plan=null}) {
+    if(!plan)plan=this.textPlan([...this.documents].find(([,item])=>item.doc===doc)?.[0],text,font);
+    if(width&&plan.advance*size>width+.01){if(!fit)throw Error('글자가 선택 영역보다 깁니다. 크기를 줄여주세요.');size=width/plan.advance;if(size<4)throw Error('내용이 너무 깁니다. 영역을 넓히거나 글자 수를 줄여주세요.');}
+    const matrix=mupdf.Matrix.invert(page.getTransform()).map(numeric).join(' '),ink=rgb(color).map(numeric).join(' ');let x=origin[0];
+    for(const run of plan.runs){let ref=doc.addFont(run.face);const name='SPDF_Font_'+(++this.sequence);
+      if(run.original){const mapping=new Map();const chars=[...run.text];run.glyphs.forEach((gid,i)=>mapping.set(gid,chars[i]));const rows=[...mapping].map(([gid,c])=>`<${gid.toString(16).padStart(4,'0')}> <${Array.from({length:c.length},(_,i)=>c.charCodeAt(i).toString(16).padStart(4,'0')).join('')}>`);let cmap='/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def /CMapName /SPDFUnicode def /CMapType 2 def 1 begincodespacerange <0000> <FFFF> endcodespacerange\n';for(let i=0;i<rows.length;i+=100)cmap+=`${Math.min(100,rows.length-i)} beginbfchar\n${rows.slice(i,i+100).join('\n')}\nendbfchar\n`;cmap+='endcmap CMapName currentdict /CMap defineresource pop end end';const dict=dictionaryCopy(doc,ref),unicode=doc.addStream(cmap,{}),copy=doc.addObject(dict);copy.put('ToUnicode',unicode);drop(dict,unicode,ref);ref=copy;}
+      pageResource(doc,page,'Font',name,ref);drop(ref);const hex=run.glyphs.map(gid=>gid.toString(16).padStart(4,'0')).join('');appendContent(doc,page,`q ${matrix} cm BT /${name} ${numeric(size)} Tf ${invisible?'3':run.bold&&!run.original?'2':'0'} Tr ${numeric(size*.018)} w ${ink} rg ${ink} RG 1 0 ${run.italic&&!run.original?'.2':'0'} -1 ${numeric(x)} ${numeric(origin[1])} Tm <${hex}> Tj ET Q\n`);x+=run.advance*size;}
+  }
+  editText({id,page:index=0,rect,text,size=12,color=null,font='auto',sourceFontKey=null,replace=false,origin=null,fit=true,clearImage=false}) {
+    if(!text.trim())throw Error('새로 넣을 글자를 입력해주세요.');
+    let sourceLine;if(replace&&!sourceFontKey){sourceLine=this.text({id,page:index}).lines.filter(l=>intersect(l.rect,rect)).sort((a,b)=>Math.hypot(a.rect[0]-rect[0],a.rect[1]-rect[1])-Math.hypot(b.rect[0]-rect[0],b.rect[1]-rect[1]))[0];sourceFontKey=sourceLine?.fontKey;}
+    const plan=this.textPlan(id,text,font,sourceFontKey);if(!plan.text.trim())throw Error('새로 넣을 글자를 입력해주세요.');
+    if(plan.advance*size>rect[2]-rect[0]+.01&&(!fit||(rect[2]-rect[0])/plan.advance<4))throw Error('내용이 너무 깁니다. 영역을 넓히거나 글자 크기를 줄여주세요.');
+    const meta=this.operation(id,replace?'기존 글자 수정':'글자 추가',doc=>{const page=doc.loadPage(index);try{
+      if(replace){const redact=page.createAnnotation('Redact');redact.setRect(rect);redact.update();drop(redact);page.applyRedactions(false,clearImage?2:0,0,0);}
+      this.insertText(doc,page,{text:plan.text,origin:origin||sourceLine?.origin||[rect[0],rect[1]+size],size,color:color||sourceLine?.color||'#202c42',width:rect[2]-rect[0],fit,plan});
+    }finally{drop(page);}});
+    return {...meta,textEdit:{sourceFont:plan.source,sourceMatched:plan.sourceMatched,substituted:plan.substituted,fallback:plan.fallback,normalized:plan.normalized,usedFonts:[...new Set(plan.runs.map(r=>r.name))]}};
   }
   annotate({id,page:index=0,type='Highlight',rect,color='#f0b92f',text='',arrow=true,line=null}) {
     return this.operation(id,'주석 추가',doc=>{
