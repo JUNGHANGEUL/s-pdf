@@ -3,7 +3,7 @@ import mupdf, {emptyStore} from './vendor/mupdf/mupdf.js';
 import {bandedPNG} from './png.mjs';
 import {CAPTURE_LIMITS} from './capture.mjs';
 
-export const VERSION = '3.4.0';
+export const VERSION = '3.4.1';
 const MAX_PIXELS = 60_000_000;
 const drop = (...objects) => objects.forEach(object => object?.destroy?.());
 const intersect = (a,b) => a[0]<b[2] && a[2]>b[0] && a[1]<b[3] && a[3]>b[1];
